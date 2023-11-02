@@ -116,12 +116,14 @@ impl Request {
         headers
             .entry(http::header::CONTENT_TYPE.into())
             .or_insert(HeaderValue::from_static(APPLICATION_JSON.essence_str()).into());
+        let context = context.unwrap_or_default();
+
         Request::new(
             query,
             operation_name,
             variables,
             extensions,
-            context.unwrap_or_default(),
+            context,
             headers,
             Uri::from_static("http://default"),
             method.unwrap_or(Method::POST),
@@ -131,29 +133,31 @@ impl Request {
     /// Create a request with an example query, for tests
     #[builder(visibility = "pub")]
     fn canned_new(
+        query: Option<String>,
         operation_name: Option<String>,
         // Skip the `Object` type alias in order to use buildstructor’s map special-casing
         extensions: JsonMap<ByteString, Value>,
         context: Option<Context>,
         headers: MultiMap<TryIntoHeaderName, TryIntoHeaderValue>,
     ) -> Result<Request, BoxError> {
-        let query = "
-            query TopProducts($first: Int) { 
-                topProducts(first: $first) { 
-                    upc 
-                    name 
-                    reviews { 
-                        id 
-                        product { name } 
-                        author { id name } 
-                    } 
-                } 
+        let default_query = "
+            query TopProducts($first: Int) {
+                topProducts(first: $first) {
+                    upc
+                    name
+                    reviews {
+                        id
+                        product { name }
+                        author { id name }
+                    }
+                }
             }
         ";
+        let query = query.unwrap_or(default_query.to_string());
         let mut variables = JsonMap::new();
         variables.insert("first", 2_usize.into());
         Self::fake_new(
-            Some(query.to_owned()),
+            Some(query),
             operation_name,
             variables,
             extensions,
@@ -245,6 +249,34 @@ impl Response {
             headers,
             context.unwrap_or_default(),
         )
+    }
+
+    /// This is the constructor (or builder) to use when constructing a "fake" Response stream.
+    ///
+    /// This does not enforce the provision of the data that is required for a fully functional
+    /// Response. It's usually enough for testing, when a fully constructed Response is
+    /// difficult to construct and not required for the purposes of the test.
+    ///
+    /// In addition, fake responses are expected to be valid, and will panic if given invalid values.
+    #[builder(visibility = "pub")]
+    fn fake_stream_new(
+        responses: Vec<graphql::Response>,
+        status_code: Option<StatusCode>,
+        headers: MultiMap<TryIntoHeaderName, TryIntoHeaderValue>,
+        context: Context,
+    ) -> Result<Self, BoxError> {
+        let mut builder = http::Response::builder().status(status_code.unwrap_or(StatusCode::OK));
+        for (key, values) in headers {
+            let header_name: HeaderName = key.try_into()?;
+            for value in values {
+                let header_value: HeaderValue = value.try_into()?;
+                builder = builder.header(header_name.clone(), header_value);
+            }
+        }
+
+        let stream = futures::stream::iter(responses);
+        let response = builder.body(stream.boxed())?;
+        Ok(Self { response, context })
     }
 
     /// This is the constructor (or builder) to use when constructing a Response that represents a global error.

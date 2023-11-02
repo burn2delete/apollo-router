@@ -1,13 +1,19 @@
 telemetry:
+  metrics:
+    prometheus:
+      listen: 127.0.0.1:4000
+      enabled: true
+      path: /metrics
   tracing:
     experimental_response_trace_id:
       enabled: true
       header_name: apollo-custom-trace-id
     propagation:
       jaeger: true
-    trace_config:
+    common:
       service_name: router
     jaeger:
+      enabled: true
       batch_processor:
         scheduled_delay: 100ms
       agent:

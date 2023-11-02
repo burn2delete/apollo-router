@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fmt::Display;
 use std::sync::Arc;
 
@@ -10,23 +9,28 @@ use tracing::instrument;
 use tracing::Instrument;
 
 use super::execution::ExecutionParameters;
+use super::rewrites;
 use super::selection::select_object;
 use super::selection::Selection;
 use crate::error::Error;
 use crate::error::FetchError;
+use crate::graphql;
 use crate::graphql::Request;
+use crate::http_ext;
+use crate::json_ext;
 use crate::json_ext::Object;
 use crate::json_ext::Path;
 use crate::json_ext::Value;
 use crate::json_ext::ValueExt;
-use crate::services::subgraph_service::SubgraphServiceFactory;
-use crate::*;
+use crate::services::SubgraphRequest;
+use crate::spec::Schema;
 
 /// GraphQL operation type.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum OperationKind {
+    #[default]
     Query,
     Mutation,
     Subscription,
@@ -46,11 +50,34 @@ impl OperationKind {
             OperationKind::Subscription => "Subscription",
         }
     }
+
+    /// Only for apollo studio exporter
+    pub(crate) const fn as_apollo_operation_type(&self) -> &'static str {
+        match self {
+            OperationKind::Query => "query",
+            OperationKind::Mutation => "mutation",
+            OperationKind::Subscription => "subscription",
+        }
+    }
 }
 
-impl Default for OperationKind {
-    fn default() -> Self {
-        OperationKind::Query
+impl From<OperationKind> for apollo_compiler::ast::OperationType {
+    fn from(value: OperationKind) -> Self {
+        match value {
+            OperationKind::Query => apollo_compiler::ast::OperationType::Query,
+            OperationKind::Mutation => apollo_compiler::ast::OperationType::Mutation,
+            OperationKind::Subscription => apollo_compiler::ast::OperationType::Subscription,
+        }
+    }
+}
+
+impl From<apollo_compiler::ast::OperationType> for OperationKind {
+    fn from(value: apollo_compiler::ast::OperationType) -> Self {
+        match value {
+            apollo_compiler::ast::OperationType::Query => OperationKind::Query,
+            apollo_compiler::ast::OperationType::Mutation => OperationKind::Mutation,
+            apollo_compiler::ast::OperationType::Subscription => OperationKind::Subscription,
+        }
     }
 }
 
@@ -80,23 +107,30 @@ pub(crate) struct FetchNode {
 
     /// Optional id used by Deferred nodes
     pub(crate) id: Option<String>,
+
+    // Optionally describes a number of "rewrites" that query plan executors should apply to the data that is sent as input of this fetch.
+    pub(crate) input_rewrites: Option<Vec<rewrites::DataRewrite>>,
+
+    // Optionally describes a number of "rewrites" to apply to the data that received from a fetch (and before it is applied to the current in-memory results).
+    pub(crate) output_rewrites: Option<Vec<rewrites::DataRewrite>>,
 }
 
-struct Variables {
-    variables: Object,
-    paths: HashMap<Path, usize>,
+pub(crate) struct Variables {
+    pub(crate) variables: Object,
+    pub(crate) inverted_paths: Vec<Vec<Path>>,
 }
 
 impl Variables {
     #[instrument(skip_all, level = "debug", name = "make_variables")]
-    async fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
         requires: &[Selection],
         variable_usages: &[String],
         data: &Value,
         current_dir: &Path,
         request: &Arc<http::Request<Request>>,
         schema: &Schema,
-        enable_deduplicate_variables: bool,
+        input_rewrites: &Option<Vec<rewrites::DataRewrite>>,
     ) -> Option<Variables> {
         let body = request.body();
         if !requires.is_empty() {
@@ -108,50 +142,39 @@ impl Variables {
                     .map(|(variable_key, value)| (variable_key.clone(), value.clone()))
             }));
 
-            let mut paths: HashMap<Path, usize> = HashMap::new();
-            let (paths, representations) = if enable_deduplicate_variables {
-                let mut values: IndexSet<Value> = IndexSet::new();
-                data.select_values_and_paths(current_dir, |path, value| {
-                    if let Value::Object(content) = value {
-                        if let Ok(Some(value)) = select_object(content, requires, schema) {
-                            match values.get_index_of(&value) {
-                                Some(index) => {
-                                    paths.insert(path.clone(), index);
-                                }
-                                None => {
-                                    paths.insert(path.clone(), values.len());
-                                    values.insert(value);
-                                }
+            let mut inverted_paths: Vec<Vec<Path>> = Vec::new();
+            let mut values: IndexSet<Value> = IndexSet::new();
+
+            data.select_values_and_paths(schema, current_dir, |path, value| {
+                if let Value::Object(content) = value {
+                    if let Ok(Some(mut value)) = select_object(content, requires, schema) {
+                        rewrites::apply_rewrites(schema, &mut value, input_rewrites);
+                        match values.get_index_of(&value) {
+                            Some(index) => {
+                                inverted_paths[index].push(path.clone());
+                            }
+                            None => {
+                                inverted_paths.push(vec![path.clone()]);
+                                values.insert(value);
+                                debug_assert!(inverted_paths.len() == values.len());
                             }
                         }
                     }
-                });
-
-                if values.is_empty() {
-                    return None;
                 }
+            });
 
-                (paths, Value::Array(Vec::from_iter(values)))
-            } else {
-                let mut values: Vec<Value> = Vec::new();
-                data.select_values_and_paths(current_dir, |path, value| {
-                    if let Value::Object(content) = value {
-                        if let Ok(Some(value)) = select_object(content, requires, schema) {
-                            paths.insert(path.clone(), values.len());
-                            values.push(value);
-                        }
-                    }
-                });
+            if values.is_empty() {
+                return None;
+            }
 
-                if values.is_empty() {
-                    return None;
-                }
+            let representations = Value::Array(Vec::from_iter(values));
 
-                (paths, Value::Array(Vec::from_iter(values)))
-            };
             variables.insert("representations", representations);
 
-            Some(Variables { variables, paths })
+            Some(Variables {
+                variables,
+                inverted_paths,
+            })
         } else {
             // with nested operations (Query or Mutation has an operation returning a Query or Mutation),
             // when the first fetch fails, the query plan will still execute up until the second fetch,
@@ -160,7 +183,7 @@ impl Variables {
             // should not perform the next fetch
             if !current_dir.is_empty()
                 && data
-                    .get_path(current_dir)
+                    .get_path(schema, current_dir)
                     .map(|value| value.is_null())
                     .unwrap_or(true)
             {
@@ -176,7 +199,7 @@ impl Variables {
                             .map(|(variable_key, value)| (variable_key.clone(), value.clone()))
                     })
                     .collect::<Object>(),
-                paths: HashMap::new(),
+                inverted_paths: Vec::new(),
             })
         }
     }
@@ -184,15 +207,12 @@ impl Variables {
 
 impl FetchNode {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn fetch_node<'a, SF>(
+    pub(crate) async fn fetch_node<'a>(
         &'a self,
-        parameters: &'a ExecutionParameters<'a, SF>,
+        parameters: &'a ExecutionParameters<'a>,
         data: &'a Value,
         current_dir: &'a Path,
-    ) -> Result<(Value, Vec<Error>), FetchError>
-    where
-        SF: SubgraphServiceFactory,
-    {
+    ) -> Result<(Value, Vec<Error>), FetchError> {
         let FetchNode {
             operation,
             operation_kind,
@@ -201,7 +221,10 @@ impl FetchNode {
             ..
         } = self;
 
-        let Variables { variables, paths } = match Variables::new(
+        let Variables {
+            variables,
+            inverted_paths: paths,
+        } = match Variables::new(
             &self.requires,
             self.variable_usages.as_ref(),
             data,
@@ -209,10 +232,8 @@ impl FetchNode {
             // Needs the original request here
             parameters.supergraph_request,
             parameters.schema,
-            parameters.options.enable_deduplicate_variables,
-        )
-        .await
-        {
+            &self.input_rewrites,
+        ) {
             Some(variables) => variables,
             None => {
                 return Ok((Value::Object(Object::default()), Vec::new()));
@@ -227,12 +248,10 @@ impl FetchNode {
                     .uri(
                         parameters
                             .schema
-                            .subgraphs()
-                            .find_map(|(name, url)| (name == service_name).then_some(url))
+                            .subgraph_url(service_name)
                             .unwrap_or_else(|| {
                                 panic!(
-                                    "schema uri for subgraph '{}' should already have been checked",
-                                    service_name
+                                    "schema uri for subgraph '{service_name}' should already have been checked"
                                 )
                             })
                             .clone(),
@@ -265,9 +284,20 @@ impl FetchNode {
             // when errors have been redacted in the include_subgraph_errors module.
             // Unfortunately, not easy to fix here, because at this point we don't
             // know if we should be redacting errors for this subgraph...
-            .map_err(|e| FetchError::SubrequestHttpError {
-                service: service_name.to_string(),
-                reason: e.to_string(),
+            .map_err(|e| match e.downcast::<FetchError>() {
+                Ok(inner) => match *inner {
+                    FetchError::SubrequestHttpError { .. } => *inner,
+                    _ => FetchError::SubrequestHttpError {
+                        status_code: None,
+                        service: service_name.to_string(),
+                        reason: inner.to_string(),
+                    },
+                },
+                Err(e) => FetchError::SubrequestHttpError {
+                    status_code: None,
+                    service: service_name.to_string(),
+                    reason: e.to_string(),
+                },
             })?
             .response
             .into_parts();
@@ -280,9 +310,11 @@ impl FetchNode {
             });
         }
 
-        let (value, errors) = self.response_at_path(current_dir, paths, response);
+        let (value, errors) =
+            self.response_at_path(parameters.schema, current_dir, paths, response);
         if let Some(id) = &self.id {
             if let Some(sender) = parameters.deferred_fetches.get(id.as_str()) {
+                tracing::info!(monotonic_counter.apollo.router.operations.defer.fetch = 1u64);
                 if let Err(e) = sender.clone().send((value.clone(), errors.clone())) {
                     tracing::error!("error sending fetch result at path {} and id {:?} for deferred response building: {}", current_dir, self.id, e);
                 }
@@ -294,21 +326,20 @@ impl FetchNode {
     #[instrument(skip_all, level = "debug", name = "response_insert")]
     fn response_at_path<'a>(
         &'a self,
+        schema: &Schema,
         current_dir: &'a Path,
-        paths: HashMap<Path, usize>,
+        inverted_paths: Vec<Vec<Path>>,
         response: graphql::Response,
     ) -> (Value, Vec<Error>) {
-        // for each entity in the response, find out the path where it must be inserted
-        let mut inverted_paths: HashMap<usize, Vec<&Path>> = HashMap::new();
-        for (path, index) in paths.iter() {
-            (*inverted_paths.entry(*index).or_default()).push(path);
-        }
-
         if !self.requires.is_empty() {
             let entities_path = Path(vec![json_ext::PathElement::Key("_entities".to_string())]);
 
             let mut errors: Vec<Error> = vec![];
-            for error in response.errors {
+            for mut error in response.errors {
+                // the locations correspond to the subgraph query and cannot be linked to locations
+                // in the client query, so we remove them
+                error.locations = Vec::new();
+
                 // errors with path should be updated to the path of the entity they target
                 if let Some(ref path) = error.path {
                     if path.starts_with(&entities_path) {
@@ -317,7 +348,7 @@ impl FetchNode {
                         match path.0.get(1) {
                             Some(json_ext::PathElement::Index(i)) => {
                                 for values_path in
-                                    inverted_paths.get(i).iter().flat_map(|v| v.iter())
+                                    inverted_paths.get(*i).iter().flat_map(|v| v.iter())
                                 {
                                     errors.push(Error {
                                         locations: error.locations.clone(),
@@ -331,9 +362,13 @@ impl FetchNode {
                                     })
                                 }
                             }
-                            _ => errors.push(error),
+                            _ => {
+                                error.path = Some(current_dir.clone());
+                                errors.push(error)
+                            }
                         }
                     } else {
+                        error.path = Some(current_dir.clone());
                         errors.push(error);
                     }
                 } else {
@@ -350,9 +385,19 @@ impl FetchNode {
                     if let Value::Array(array) = entities {
                         let mut value = Value::default();
 
-                        for (path, entity_idx) in paths {
-                            if let Some(entity) = array.get(entity_idx) {
-                                let _ = value.insert(&path, entity.clone());
+                        for (index, mut entity) in array.into_iter().enumerate() {
+                            rewrites::apply_rewrites(schema, &mut entity, &self.output_rewrites);
+
+                            if let Some(paths) = inverted_paths.get(index) {
+                                if paths.len() > 1 {
+                                    for path in &paths[1..] {
+                                        let _ = value.insert(path, entity.clone());
+                                    }
+                                }
+
+                                if let Some(path) = paths.first() {
+                                    let _ = value.insert(path, entity);
+                                }
                             }
                         }
                         return (value, errors);
@@ -360,16 +405,16 @@ impl FetchNode {
                 }
             }
 
-            errors.push(
-                Error::builder()
-                    .path(current_dir.clone())
-                    .message(format!(
-                        "Subgraph response from '{}' was missing key `_entities`",
-                        self.service_name
-                    ))
-                    .extension_code("PARSE_ERROR")
-                    .build(),
-            );
+            // if we get here, it means that the response was missing the `_entities` key
+            // This can happen if the subgraph failed during query execution e.g. for permissions checks.
+            // In this case we should add an additional error because the subgraph should have returned an error that will be bubbled up to the client.
+            // However, if they have not then print a warning to the logs.
+            if errors.is_empty() {
+                tracing::warn!(
+                    "Subgraph response from '{}' was missing key `_entities` and had no errors. This is likely a bug in the subgraph.",
+                    self.service_name
+                );
+            }
 
             (Value::Null, errors)
         } else {
@@ -395,10 +440,9 @@ impl FetchNode {
                     }
                 })
                 .collect();
-            (
-                Value::from_path(current_dir, response.data.unwrap_or_default()),
-                errors,
-            )
+            let mut data = response.data.unwrap_or_default();
+            rewrites::apply_rewrites(schema, &mut data, &self.output_rewrites);
+            (Value::from_path(current_dir, data), errors)
         }
     }
 

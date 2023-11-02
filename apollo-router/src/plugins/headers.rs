@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 
@@ -36,7 +37,7 @@ use crate::plugin::Plugin;
 use crate::plugin::PluginInit;
 use crate::register_plugin;
 use crate::services::subgraph;
-use crate::SubgraphRequest;
+use crate::services::SubgraphRequest;
 
 register_plugin!("apollo", "headers", Headers);
 
@@ -57,16 +58,23 @@ enum Operation {
     Propagate(Propagate),
 }
 
+schemar_fn!(remove_named, String, "Remove a header given a header name");
+schemar_fn!(
+    remove_matching,
+    String,
+    "Remove a header given a regex matching against the header name"
+);
+
 #[derive(Clone, JsonSchema, Deserialize)]
 #[serde(rename_all = "snake_case")]
 /// Remove header
 enum Remove {
-    #[schemars(with = "String")]
+    #[schemars(schema_with = "remove_named")]
     #[serde(deserialize_with = "deserialize_header_name")]
     /// Remove a header given a header name
     Named(HeaderName),
 
-    #[schemars(schema_with = "string_schema")]
+    #[schemars(schema_with = "remove_matching")]
     #[serde(deserialize_with = "deserialize_regex")]
     /// Remove a header given a regex matching header name
     Matching(Regex),
@@ -89,10 +97,13 @@ enum Insert {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 /// Insert static header
 struct InsertStatic {
-    #[schemars(schema_with = "string_schema")]
+    /// The name of the header
+    #[schemars(with = "String")]
     #[serde(deserialize_with = "deserialize_header_name")]
     name: HeaderName,
-    #[schemars(schema_with = "string_schema")]
+
+    /// The value for the header
+    #[schemars(with = "String")]
     #[serde(deserialize_with = "deserialize_header_value")]
     value: HeaderValue,
 }
@@ -101,7 +112,7 @@ struct InsertStatic {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 /// Insert header with a value coming from context key
 struct InsertFromContext {
-    #[schemars(schema_with = "string_schema")]
+    #[schemars(with = "String")]
     #[serde(deserialize_with = "deserialize_header_name")]
     /// Specify header name
     name: HeaderName,
@@ -113,16 +124,27 @@ struct InsertFromContext {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 /// Insert header with a value coming from body
 struct InsertFromBody {
-    #[schemars(schema_with = "string_schema")]
+    /// The target header name
+    #[schemars(with = "String")]
     #[serde(deserialize_with = "deserialize_header_name")]
     name: HeaderName,
-    #[schemars(schema_with = "string_schema")]
+
+    /// The path in the request body
+    #[schemars(with = "String")]
     #[serde(deserialize_with = "deserialize_json_query")]
     path: JSONQuery,
-    #[schemars(schema_with = "option_string_schema", default)]
+
+    /// The default if the path in the body did not resolve to an element
+    #[schemars(with = "Option<String>", default)]
     #[serde(deserialize_with = "deserialize_option_header_value")]
     default: Option<HeaderValue>,
 }
+
+schemar_fn!(
+    propagate_matching,
+    String,
+    "Remove a header given a regex matching header name"
+);
 
 #[derive(Clone, JsonSchema, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -131,43 +153,43 @@ struct InsertFromBody {
 enum Propagate {
     /// Propagate header given a header name
     Named {
-        #[schemars(schema_with = "string_schema")]
+        /// The source header name
+        #[schemars(with = "String")]
         #[serde(deserialize_with = "deserialize_header_name")]
         named: HeaderName,
-        #[schemars(schema_with = "option_string_schema", default)]
+
+        /// An optional target header name
+        #[schemars(with = "Option<String>", default)]
         #[serde(deserialize_with = "deserialize_option_header_name", default)]
         rename: Option<HeaderName>,
-        #[schemars(schema_with = "option_string_schema", default)]
+
+        /// Default value for the header.
+        #[schemars(with = "Option<String>", default)]
         #[serde(deserialize_with = "deserialize_option_header_value", default)]
         default: Option<HeaderValue>,
     },
     /// Propagate header given a regex to match header name
     Matching {
-        #[schemars(schema_with = "string_schema")]
+        /// The regex on header name
+        #[schemars(schema_with = "propagate_matching")]
         #[serde(deserialize_with = "deserialize_regex")]
         matching: Regex,
     },
 }
 
-#[derive(Clone, JsonSchema, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+/// Configuration for header propagation
+#[derive(Clone, JsonSchema, Default, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields, default)]
 struct Config {
-    #[serde(default)]
+    /// Rules to apply to all subgraphs
     all: Option<HeadersLocation>,
-    #[serde(default)]
+    /// Rules to specific subgraphs
     subgraphs: HashMap<String, HeadersLocation>,
 }
 
 struct Headers {
-    config: Config,
-}
-
-fn string_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-    String::json_schema(gen)
-}
-
-fn option_string_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-    Option::<String>::json_schema(gen)
+    all_operations: Arc<Vec<Operation>>,
+    subgraph_operations: HashMap<String, Arc<Vec<Operation>>>,
 }
 
 #[async_trait::async_trait]
@@ -175,36 +197,48 @@ impl Plugin for Headers {
     type Config = Config;
 
     async fn new(init: PluginInit<Self::Config>) -> Result<Self, BoxError> {
-        Ok(Headers {
-            config: init.config,
-        })
-    }
-    fn subgraph_service(&self, name: &str, service: subgraph::BoxService) -> subgraph::BoxService {
-        let mut operations: Vec<Operation> = self
+        let operations: Vec<Operation> = init
             .config
             .all
             .as_ref()
             .map(|a| a.request.clone())
             .unwrap_or_default();
-        if let Some(mut subgraph_operations) =
-            self.config.subgraphs.get(name).map(|s| s.request.clone())
-        {
-            operations.append(&mut subgraph_operations);
-        }
+        let subgraph_operations = init
+            .config
+            .subgraphs
+            .iter()
+            .map(|(subgraph_name, op)| {
+                let mut operations = operations.clone();
+                operations.append(&mut op.request.clone());
+                (subgraph_name.clone(), Arc::new(operations))
+            })
+            .collect();
 
+        Ok(Headers {
+            all_operations: Arc::new(operations),
+            subgraph_operations,
+        })
+    }
+
+    fn subgraph_service(&self, name: &str, service: subgraph::BoxService) -> subgraph::BoxService {
         ServiceBuilder::new()
-            .layer(HeadersLayer::new(operations))
+            .layer(HeadersLayer::new(
+                self.subgraph_operations
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| self.all_operations.clone()),
+            ))
             .service(service)
             .boxed()
     }
 }
 
 struct HeadersLayer {
-    operations: Vec<Operation>,
+    operations: Arc<Vec<Operation>>,
 }
 
 impl HeadersLayer {
-    fn new(operations: Vec<Operation>) -> Self {
+    fn new(operations: Arc<Vec<Operation>>) -> Self {
         Self { operations }
     }
 }
@@ -221,7 +255,7 @@ impl<S> Layer<S> for HeadersLayer {
 }
 struct HeadersService<S> {
     inner: S,
-    operations: Vec<Operation>,
+    operations: Arc<Vec<Operation>>,
 }
 
 lazy_static! {
@@ -259,7 +293,7 @@ where
     }
 
     fn call(&mut self, mut req: SubgraphRequest) -> Self::Future {
-        for operation in &self.operations {
+        for operation in &*self.operations {
             match operation {
                 Operation::Insert(insert_config) => match insert_config {
                     Insert::Static(static_insert) => {
@@ -320,16 +354,18 @@ where
                 }
                 Operation::Remove(Remove::Matching(matching)) => {
                     let headers = req.subgraph_request.headers_mut();
-                    let matching_headers = headers
-                        .iter()
-                        .filter_map(|(name, _)| {
-                            matching.is_match(name.as_str()).then(|| name.clone())
+                    let new_headers = headers
+                        .drain()
+                        .filter_map(|(name, value)| {
+                            name.and_then(|name| {
+                                (RESERVED_HEADERS.contains(&name)
+                                    || !matching.is_match(name.as_str()))
+                                .then_some((name, value))
+                            })
                         })
-                        .filter(|name| !RESERVED_HEADERS.contains(name))
-                        .collect::<Vec<_>>();
-                    for name in matching_headers {
-                        headers.remove(name);
-                    }
+                        .collect();
+
+                    let _ = std::mem::replace(headers, new_headers);
                 }
                 Operation::Propagate(Propagate::Named {
                     named,
@@ -347,8 +383,9 @@ where
                     req.supergraph_request
                         .headers()
                         .iter()
-                        .filter(|(name, _)| matching.is_match(name.as_str()))
-                        .filter(|(name, _)| !RESERVED_HEADERS.contains(name))
+                        .filter(|(name, _)| {
+                            !RESERVED_HEADERS.contains(name) && matching.is_match(name.as_str())
+                        })
                         .for_each(|(name, value)| {
                             headers.insert(name, value.clone());
                         });
@@ -373,9 +410,9 @@ mod test {
     use crate::plugins::headers::Config;
     use crate::plugins::headers::HeadersLayer;
     use crate::query_planner::fetch::OperationKind;
+    use crate::services::SubgraphRequest;
+    use crate::services::SubgraphResponse;
     use crate::Context;
-    use crate::SubgraphRequest;
-    use crate::SubgraphResponse;
 
     #[test]
     fn test_subgraph_config() {
@@ -500,12 +537,13 @@ mod test {
             })
             .returning(example_response);
 
-        let mut service =
-            HeadersLayer::new(vec![Operation::Insert(Insert::Static(InsertStatic {
+        let mut service = HeadersLayer::new(Arc::new(vec![Operation::Insert(Insert::Static(
+            InsertStatic {
                 name: "c".try_into()?,
                 value: "d".try_into()?,
-            }))])
-            .layer(mock);
+            },
+        ))]))
+        .layer(mock);
 
         service.ready().await?.call(example_request()).await?;
         Ok(())
@@ -526,12 +564,12 @@ mod test {
             })
             .returning(example_response);
 
-        let mut service = HeadersLayer::new(vec![Operation::Insert(Insert::FromContext(
-            InsertFromContext {
+        let mut service = HeadersLayer::new(Arc::new(vec![Operation::Insert(
+            Insert::FromContext(InsertFromContext {
                 name: "header_from_context".try_into()?,
                 from_context: "my_key".to_string(),
-            },
-        ))])
+            }),
+        )]))
         .layer(mock);
 
         service.ready().await?.call(example_request()).await?;
@@ -553,13 +591,14 @@ mod test {
             })
             .returning(example_response);
 
-        let mut service =
-            HeadersLayer::new(vec![Operation::Insert(Insert::FromBody(InsertFromBody {
+        let mut service = HeadersLayer::new(Arc::new(vec![Operation::Insert(Insert::FromBody(
+            InsertFromBody {
                 name: "header_from_request".try_into()?,
                 path: JSONQuery::parse(".operationName")?,
                 default: None,
-            }))])
-            .layer(mock);
+            },
+        ))]))
+        .layer(mock);
 
         service.ready().await?.call(example_request()).await?;
         Ok(())
@@ -573,8 +612,10 @@ mod test {
             .withf(|request| request.assert_headers(vec![("ac", "vac"), ("ab", "vab")]))
             .returning(example_response);
 
-        let mut service =
-            HeadersLayer::new(vec![Operation::Remove(Remove::Named("aa".try_into()?))]).layer(mock);
+        let mut service = HeadersLayer::new(Arc::new(vec![Operation::Remove(Remove::Named(
+            "aa".try_into()?,
+        ))]))
+        .layer(mock);
 
         service.ready().await?.call(example_request()).await?;
         Ok(())
@@ -588,9 +629,9 @@ mod test {
             .withf(|request| request.assert_headers(vec![("ac", "vac")]))
             .returning(example_response);
 
-        let mut service = HeadersLayer::new(vec![Operation::Remove(Remove::Matching(
+        let mut service = HeadersLayer::new(Arc::new(vec![Operation::Remove(Remove::Matching(
             Regex::from_str("a[ab]")?,
-        ))])
+        ))]))
         .layer(mock);
 
         service.ready().await?.call(example_request()).await?;
@@ -613,10 +654,11 @@ mod test {
             })
             .returning(example_response);
 
-        let mut service = HeadersLayer::new(vec![Operation::Propagate(Propagate::Matching {
-            matching: Regex::from_str("d[ab]")?,
-        })])
-        .layer(mock);
+        let mut service =
+            HeadersLayer::new(Arc::new(vec![Operation::Propagate(Propagate::Matching {
+                matching: Regex::from_str("d[ab]")?,
+            })]))
+            .layer(mock);
 
         service.ready().await?.call(example_request()).await?;
         Ok(())
@@ -637,12 +679,13 @@ mod test {
             })
             .returning(example_response);
 
-        let mut service = HeadersLayer::new(vec![Operation::Propagate(Propagate::Named {
-            named: "da".try_into()?,
-            rename: None,
-            default: None,
-        })])
-        .layer(mock);
+        let mut service =
+            HeadersLayer::new(Arc::new(vec![Operation::Propagate(Propagate::Named {
+                named: "da".try_into()?,
+                rename: None,
+                default: None,
+            })]))
+            .layer(mock);
 
         service.ready().await?.call(example_request()).await?;
         Ok(())
@@ -663,12 +706,13 @@ mod test {
             })
             .returning(example_response);
 
-        let mut service = HeadersLayer::new(vec![Operation::Propagate(Propagate::Named {
-            named: "da".try_into()?,
-            rename: Some("ea".try_into()?),
-            default: None,
-        })])
-        .layer(mock);
+        let mut service =
+            HeadersLayer::new(Arc::new(vec![Operation::Propagate(Propagate::Named {
+                named: "da".try_into()?,
+                rename: Some("ea".try_into()?),
+                default: None,
+            })]))
+            .layer(mock);
 
         service.ready().await?.call(example_request()).await?;
         Ok(())
@@ -689,12 +733,13 @@ mod test {
             })
             .returning(example_response);
 
-        let mut service = HeadersLayer::new(vec![Operation::Propagate(Propagate::Named {
-            named: "ea".try_into()?,
-            rename: None,
-            default: Some("defaulted".try_into()?),
-        })])
-        .layer(mock);
+        let mut service =
+            HeadersLayer::new(Arc::new(vec![Operation::Propagate(Propagate::Named {
+                named: "ea".try_into()?,
+                rename: None,
+                default: Some("defaulted".try_into()?),
+            })]))
+            .layer(mock);
 
         service.ready().await?.call(example_request()).await?;
         Ok(())
@@ -739,6 +784,8 @@ mod test {
                 .expect("expecting valid request"),
             operation_kind: OperationKind::Query,
             context: ctx,
+            subscription_stream: None,
+            connection_closed_signal: None,
         }
     }
 

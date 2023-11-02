@@ -8,8 +8,6 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     let reports_src = proto_dir.join("reports.proto");
     let reports_out = out_dir.join("reports.proto");
 
-    println!("cargo:rerun-if-changed={}", reports_src.to_str().unwrap());
-
     // Process the retrieved content to:
     //  - Insert a package Report; line after the import lines (currently only one) and before the first message definition
     //  - Remove the Apollo TS extensions [(js_use_toArray)=true] and [(js_preEncoded)=true] from the file
@@ -20,9 +18,11 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     let message = "\nmessage";
     let msg_index = content.find(message).ok_or("cannot find message string")?;
     content.insert_str(msg_index, "\npackage Reports;\n");
-    content = content.replace("[(js_use_toArray)=true]", "");
-    content = content.replace("[(js_preEncoded)=true]", "");
+    content = content.replace("[(js_use_toArray) = true]", "");
+    content = content.replace("[(js_preEncoded) = true]", "");
     std::fs::write(&reports_out, &content)?;
+
+    println!("cargo:rerun-if-changed={}", reports_src.to_str().unwrap());
 
     // Process the proto files
 
@@ -49,6 +49,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         )
         .type_attribute(".", "#[derive(serde::Serialize)]")
         .type_attribute("StatsContext", "#[derive(Eq, Hash)]")
+        .emit_rerun_if_changed(false)
         .compile(&[reports_out],  &[&out_dir])?;
 
     Ok(())

@@ -4,6 +4,9 @@ metadata:
   name: {{ include "router.fullname" . }}
   labels:
     {{- include "router.labels" . | nindent 4 }}
+    {{- if .Values.extraLabels }}
+    {{- include "common.templatizeExtraLabels" . | trim | nindent 4 }}
+    {{- end }}
   {{- with .Values.service.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
@@ -15,7 +18,7 @@ spec:
       targetPort: http
       protocol: TCP
       name: http
-    - port: {{ (splitList ":" (index .Values.router.configuration "health-check").listen | last ) | default "8088" }}
+    - port: {{ (splitList ":" (index .Values.router.configuration "health_check").listen | last ) | default "8088" }}
       targetPort: health
       protocol: TCP
       name: health

@@ -3,6 +3,7 @@ supergraph:
 telemetry:
   tracing:
     otlp:
+      enabled: true
       endpoint: default
       grpc:
         ca: ""
@@ -14,6 +15,7 @@ telemetry:
       http:
         headers:
           foo: bar
-      timeout: 4s
+      batch_processor:
+        max_export_timeout: 4s
       protocol: grpc
 

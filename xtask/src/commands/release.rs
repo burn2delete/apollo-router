@@ -1,27 +1,29 @@
-use anyhow::{anyhow, Error, Result};
-use cargo_metadata::MetadataCommand;
-use itertools::Itertools;
-use octorust::types::{
-    IssuesCreateMilestoneRequest, IssuesListMilestonesSort, IssuesListState, IssuesUpdateRequest,
-    Milestone, Order, PullsCreateRequest, State, TitleOneOf,
-};
-use octorust::Client;
 use std::str::FromStr;
-use structopt::StructOpt;
-use tap::TapFallible;
+
+use anyhow::anyhow;
+use anyhow::Error;
+use anyhow::Result;
+use cargo_metadata::MetadataCommand;
+use chrono::prelude::Utc;
 use walkdir::WalkDir;
 use xtask::*;
 
-#[derive(Debug, StructOpt)]
+use crate::commands::changeset::slurp_and_remove_changesets;
+
+#[derive(Debug, clap::Subcommand)]
 pub enum Command {
     /// Prepare a new release
     Prepare(Prepare),
+
+    /// Verify that a release is ready to be published
+    PreVerify,
 }
 
 impl Command {
     pub fn run(&self) -> Result<()> {
         match self {
             Command::Prepare(command) => command.run(),
+            Command::PreVerify => PreVerify::run(),
         }
     }
 }
@@ -32,6 +34,7 @@ enum Version {
     Minor,
     Patch,
     Current,
+    Nightly,
     Version(String),
 }
 
@@ -45,37 +48,20 @@ impl FromStr for Version {
             "minor" => Version::Minor,
             "patch" => Version::Patch,
             "current" => Version::Current,
+            "nightly" => Version::Nightly,
             version => Version::Version(version.to_string()),
         })
     }
 }
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, clap::Parser)]
 pub struct Prepare {
-    /// Release from the current branch rather than creating a new one.
-    #[structopt(long)]
-    current_branch: bool,
-
     /// Skip the license check
-    #[structopt(long)]
-    skip_license_ckeck: bool,
-
-    /// Dry run, don't commit the changes and create the PR.
-    #[structopt(long)]
-    dry_run: bool,
+    #[clap(long)]
+    skip_license_check: bool,
 
     /// The new version that is being created OR to bump (major|minor|patch|current).
     version: Version,
-}
-
-macro_rules! git {
-    ($( $i:expr ),*) => {
-        let git = which::which("git")?;
-        let result = std::process::Command::new(git).args([$( $i ),*]).status()?;
-        if !result.success() {
-            return Err(anyhow!("git {}", [$( $i ),*].join(",")));
-        }
-    };
 }
 
 macro_rules! replace_in_file {
@@ -93,254 +79,93 @@ impl Prepare {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(async {
-                let result = self.prepare_release().await;
-                if self.dry_run {
-                    git!("reset", "--hard");
-                }
-                result
-            })
+            .block_on(async { self.prepare_release().await })
     }
 
     async fn prepare_release(&self) -> Result<(), Error> {
+        self.ensure_pristine_checkout()?;
+        self.ensure_prereqs()?;
         let version = self.update_cargo_tomls(&self.version)?;
-        let github = octorust::Client::new(
-            "router-release".to_string(),
-            octorust::auth::Credentials::Token(
-                std::env::var("GITHUB_TOKEN").expect("GITHUB_TOKEN env variable must be set"),
-            ),
-        )?;
-        if !self.current_branch && !self.dry_run {
-            self.switch_to_release_branch(&version)?;
-        }
-        self.assign_issues_to_milestone(&github, &version).await?;
-        self.update_install_script(&version)?;
-        self.update_docs(&version)?;
-        self.update_helm_charts(&version)?;
-        self.docker_files(&version)?;
-        self.finalize_changelog(&version)?;
         self.update_lock()?;
         self.check_compliance()?;
-        if !self.dry_run {
-            self.create_release_pr(&github, &version).await?;
-        }
-        Ok(())
-    }
 
-    /// Create a new branch "#.#.#" where "#.#.#" is this release's version
-    /// (release) or "#.#.#-rc.#" (release candidate)
-    fn switch_to_release_branch(&self, version: &str) -> Result<()> {
-        println!("creating release branch");
-        git!("fetch", "origin", &format!("dev:{}", version));
-        git!("checkout", &version);
-        Ok(())
-    }
-
-    /// Go through NEXT_CHANGELOG.md find all issues and assign to the milestone.
-    /// Any PR that doesn't have an issue assign to the milestone.
-    async fn assign_issues_to_milestone(&self, github: &Client, version: &str) -> Result<()> {
-        println!("assigning issues and PRs to milestone v{}", version);
-        let change_log = std::fs::read_to_string("./NEXT_CHANGELOG.md")?;
-
-        let re =
-            regex::Regex::new(r"(?ms)https://github.com/apollographql/router/(pull|issues)/(\d+)")?;
-
-        let milestone = self.get_or_create_milestone(&github, version).await?;
-        let mut errors_encountered = false;
-        for (issues_or_pull, number) in re
-            .captures_iter(&change_log)
-            .map(|m| {
-                (
-                    m.get(1).expect("expected issues or pull").as_str(),
-                    m.get(2).expect("expected issue or pull number").as_str(),
-                )
-            })
-            .sorted()
-            .dedup()
-        {
-            if let Err(e) = self
-                .handle_issue_or_pr(&github, &milestone, issues_or_pull, number)
-                .await
+        if let Version::Nightly = &self.version {
+            println!("Skipping various steps because this is a nightly build.");
+            // Only update helm charts on specific arch/os/env
+            if cfg!(target_arch = "x86_64") && cfg!(target_os = "linux") && cfg!(target_env = "gnu")
             {
-                eprintln!("{}", e);
-                errors_encountered = true;
+                // Update the image repository to use the nightly location
+                replace_in_file!(
+                    "./helm/chart/router/values.yaml",
+                    "^  repository: ghcr.io/apollographql/router$",
+                    format!("  repository: ghcr.io/apollographql/nightly/router")
+                );
+
+                // Update the version string for nightly builds
+                self.update_helm_charts(&version.replace("+", "-"))?;
             }
+        } else {
+            self.update_install_script(&version)?;
+            self.update_helm_charts(&version)?;
+            self.update_docs(&version)?;
+            self.docker_files(&version)?;
+            self.finalize_changelog(&version)?;
         }
-        if errors_encountered {
-            return Err(anyhow!("errors encountered, aborting"));
+
+        Ok(())
+    }
+
+    fn ensure_pristine_checkout(&self) -> Result<(), anyhow::Error> {
+        let git = which::which("git")?;
+        let output = std::process::Command::new(git)
+            .args(["status", "--untracked-files=no", "--porcelain"])
+            .output()?;
+
+        if !output.stdout.is_empty() {
+            return Err(anyhow!(
+                "git workspace was not clean and requires 'git stash' before releasing"
+            ));
         }
         Ok(())
     }
 
-    async fn get_or_create_milestone(&self, github: &Client, version: &str) -> Result<Milestone> {
-        Ok(
-            match github
-                .issues()
-                .list_milestones(
-                    "apollographql",
-                    "router",
-                    IssuesListState::Open,
-                    IssuesListMilestonesSort::FallthroughString,
-                    Order::FallthroughString,
-                    30,
-                    1,
-                )
-                .await?
-                .into_iter()
-                .find(|m| m.title == format!("v{}", version))
+    fn ensure_prereqs(&self) -> Result<()> {
+        if which::which("git").is_err() {
+            return Err(anyhow!(
+                "the 'git' executable could not be found in your PATH"
+            ));
+        }
+        if let Version::Nightly = &self.version {
+            if cfg!(target_arch = "x86_64") && cfg!(target_os = "linux") && cfg!(target_env = "gnu")
             {
-                Some(milestone) => milestone,
-                None => {
-                    println!("milestone not found, creating...");
-                    if !self.dry_run {
-                        github
-                            .issues()
-                            .create_milestone(
-                                "apollographql",
-                                "router",
-                                &IssuesCreateMilestoneRequest {
-                                    description: format!("Release v{}", version),
-                                    due_on: None,
-                                    state: Some(State::Open),
-                                    title: format!("v{}", version),
-                                },
-                            )
-                            .await
-                            .tap_err(|_| eprintln!("Failed to create milestone"))?
-                    } else {
-                        Milestone {
-                            closed_at: None,
-                            closed_issues: 0,
-                            created_at: None,
-                            creator: None,
-                            description: "".to_string(),
-                            due_on: None,
-                            html_url: "".to_string(),
-                            id: 0,
-                            labels_url: "".to_string(),
-                            node_id: "".to_string(),
-                            number: 0,
-                            open_issues: 0,
-                            state: Default::default(),
-                            title: "".to_string(),
-                            updated_at: None,
-                            url: "".to_string(),
-                        }
-                    }
+                if which::which("helm").is_err() {
+                    return Err(anyhow!("the 'helm' executable could not be found in your PATH.  Install it using the instructions at https://helm.sh/docs/intro/install/ and try again."));
                 }
-            },
-        )
-    }
 
-    async fn handle_issue_or_pr(
-        &self,
-        github: &Client,
-        milestone: &Milestone,
-        issues_or_pull: &str,
-        number: &str,
-    ) -> Result<()> {
-        match issues_or_pull {
-            "issues" => {
-                let issue = github
-                    .issues()
-                    .get("apollographql", "router", number.parse()?)
-                    .await
-                    .tap_err(|_| {
-                        eprintln!(
-                            "could not find issue {}, there is an error in NEXT_CHANGELOG.md",
-                            number
-                        )
-                    })?;
-                match issue.milestone {
-                    None => {
-                        println!("assigning milestone to https://github.com/apollographql/router/issues/{}", number);
-                        self.update_milestone(github, &milestone, issue.number)
-                            .await?;
-                    }
-                    Some(issue_milestone) if issue_milestone.id != milestone.id => {
-                        return Err(anyhow!("issue https://github.com/apollographql/router/issues/{} was assigned to an existing milestone", number));
-                    }
-                    _ => {}
-                }
-                if issue.assignees.is_empty() {
-                    return Err(anyhow!(
-                        "https://github.com/apollographql/router/issues/{} has no assignee",
-                        number
-                    ));
+                if which::which("helm-docs").is_err() {
+                    return Err(anyhow!("the 'helm-docs' executable could not be found in your PATH.  Install it using the instructions at https://github.com/norwoodj/helm-docs#installation and try again."));
                 }
             }
-            "pull" => {
-                let pull = github
-                    .pulls()
-                    .get("apollographql", "router", number.parse()?)
-                    .await
-                    .tap_err(|_| {
-                        eprintln!(
-                            "could not find PR {}, there is an error in NEXT_CHANGELOG.md",
-                            number
-                        )
-                    })?;
-                match pull.milestone {
-                    None => {
-                        println!(
-                            "assigning milestone to https://github.com/apollographql/router/pull/{}",
-                            number
-                        );
-                        self.update_milestone(github, &milestone, pull.number)
-                            .await?;
-                    }
-                    Some(pull_milestone) if pull_milestone.id != milestone.id => {
-                        return Err(anyhow!("issue https://github.com/apollographql/router/pull/{} was assigned to an existing milestone", number));
-                    }
-                    _ => {}
-                }
-                if pull.assignees.is_empty() {
-                    return Err(anyhow!(
-                        "https://github.com/apollographql/router/pull/{} has no assignee",
-                        number
-                    ));
-                }
-                if pull.state == State::Open {
-                    return Err(anyhow!(
-                        "https://github.com/apollographql/router/pull/{} is still open",
-                        number
-                    ));
-                }
+        } else {
+            if which::which("helm").is_err() {
+                return Err(anyhow!("the 'helm' executable could not be found in your PATH.  Install it using the instructions at https://helm.sh/docs/intro/install/ and try again."));
             }
-            _ => panic!("expected issues or pull"),
+
+            if which::which("helm-docs").is_err() {
+                return Err(anyhow!("the 'helm-docs' executable could not be found in your PATH.  Install it using the instructions at https://github.com/norwoodj/helm-docs#installation and try again."));
+            }
+        }
+
+        if which::which("cargo-about").is_err() {
+            return Err(anyhow!("the 'cargo-about' executable could not be found in your PATH.  Install it by running `cargo install --locked cargo-about"));
+        }
+
+        if which::which("cargo-deny").is_err() {
+            return Err(anyhow!("the 'cargo-deny' executable could not be found in your PATH.  Install it by running `cargo install --locked cargo-deny"));
         }
         Ok(())
     }
 
-    async fn update_milestone(
-        &self,
-        github: &Client,
-        milestone: &Milestone,
-        issue: i64,
-    ) -> Result<()> {
-        if !self.dry_run {
-            github
-                .issues()
-                .update(
-                    "apollographql",
-                    "router",
-                    issue,
-                    &IssuesUpdateRequest {
-                        assignee: "".to_string(),
-                        assignees: vec![],
-                        body: "".to_string(),
-                        labels: vec![],
-                        milestone: Some(TitleOneOf::I64(milestone.number)),
-                        state: None,
-                        title: None,
-                    },
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    /// Update the `version` in `*/Cargo.toml` (do not forget the ones in scaffold templates).
     /// Update the `apollo-router` version in the `dependencies` sections of the `Cargo.toml` files in `apollo-router-scaffold/templates/**`.
     fn update_cargo_tomls(&self, version: &Version) -> Result<String> {
         println!("updating Cargo.toml files");
@@ -367,6 +192,39 @@ impl Prepare {
                 "--package",
                 "apollo-router"
             ]),
+            Version::Nightly => {
+                // Get the first 8 characters of the current commit hash by running
+                // the Command::new("git") command.  Be sure to take the output and
+                // run that through String::from_utf8(output.stdout) to get exactly
+                // an 8 character string.
+                let head_commit = std::process::Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .output()
+                    .expect("failed to execute 'git rev-parse HEAD'")
+                    .stdout;
+
+                // If it's empty, then we're in a bad state.
+                if head_commit.is_empty() {
+                    return Err(anyhow!("failed to get the current commit hash"));
+                }
+
+                // Convert it using `String::from_utf8_lossy`, which will turn
+                // any funky characters into something really noticeable.
+                let head_commit = String::from_utf8_lossy(&head_commit);
+
+                // Just get the first 8 characters, for brevity.
+                let head_commit = head_commit.chars().take(8).collect::<String>();
+
+                replace_in_file!(
+                    "./apollo-router/Cargo.toml",
+                    r#"^(?P<existingVersion>version\s*=\s*)"[^"]+""#,
+                    format!(
+                        "${{existingVersion}}\"0.0.0-nightly.{}+{}\"",
+                        Utc::now().format("%Y%m%d"),
+                        head_commit
+                    )
+                );
+            }
             Version::Version(version) => {
                 cargo!(["set-version", version, "--package", "apollo-router"])
             }
@@ -375,27 +233,34 @@ impl Prepare {
         let metadata = MetadataCommand::new()
             .manifest_path("./apollo-router/Cargo.toml")
             .exec()?;
-        let version = metadata
+        let resolved_version = metadata
             .root_package()
             .expect("root package missing")
             .version
             .to_string();
-        let packages = vec!["apollo-router-scaffold", "apollo-router-benchmarks"];
-        for package in packages {
-            cargo!(["set-version", &version, "--package", package])
-        }
-        replace_in_file!(
-            "./apollo-router-scaffold/templates/base/Cargo.toml",
-            "^apollo-router\\s*=\\s*\"\\d+.\\d+.\\d+\"",
-            format!("apollo-router = \"{}\"", version)
-        );
-        replace_in_file!(
-            "./apollo-router-scaffold/templates/base/xtask/Cargo.toml",
-            "^apollo-router-scaffold = \\{ git=\"https://github.com/apollographql/router.git\", tag\\s*=\\s*\"v\\d+.\\d+.\\d+\"\\s*\\}",
-            format!("apollo-router-scaffold = {{ git=\"https://github.com/apollographql/router.git\", tag = \"v{}\" }}", version)
-        );
 
-        Ok(version)
+        if let Version::Nightly = version {
+            println!("Not changing `apollo-router-scaffold` or `apollo-router-benchmarks` because of nightly build mode.");
+        } else {
+            let packages = vec!["apollo-router-scaffold", "apollo-router-benchmarks"];
+            for package in packages {
+                cargo!(["set-version", &resolved_version, "--package", package])
+            }
+            replace_in_file!(
+                "./apollo-router-scaffold/templates/base/Cargo.toml",
+                "^apollo-router\\s*=\\s*\"[^\"]+\"",
+                format!("apollo-router = \"{resolved_version}\"")
+            );
+            replace_in_file!(
+                "./apollo-router-scaffold/templates/base/xtask/Cargo.toml",
+                r#"^apollo-router-scaffold = \{\s*git\s*=\s*"https://github.com/apollographql/router.git",\s*tag\s*=\s*"v[^"]+"\s*\}$"#,
+                format!(
+                    r#"apollo-router-scaffold = {{ git = "https://github.com/apollographql/router.git", tag = "v{resolved_version}" }}"#
+                )
+            );
+        }
+
+        Ok(resolved_version)
     }
 
     /// Update the `PACKAGE_VERSION` value in `scripts/install.sh` (it should be prefixed with `v`!)
@@ -404,7 +269,7 @@ impl Prepare {
         replace_in_file!(
             "./scripts/install.sh",
             "^PACKAGE_VERSION=.*$",
-            format!("PACKAGE_VERSION=\"v{}\"", version)
+            format!("PACKAGE_VERSION=\"v{version}\"")
         );
         Ok(())
     }
@@ -419,13 +284,13 @@ impl Prepare {
         println!("updating docs");
         replace_in_file!(
             "./docs/source/containerization/docker.mdx",
-            "with your chosen version. e.g.: `v\\d+.\\d+.\\d+`",
-            format!("with your chosen version. e.g.: `v{}`", version)
+            "with your chosen version. e.g.: `v[^`]+`",
+            format!("with your chosen version. e.g.: `v{version}`")
         );
         replace_in_file!(
             "./docs/source/containerization/kubernetes.mdx",
-            "router/tree/v\\d+.\\d+.\\d+",
-            format!("router/tree/v{}", version)
+            "https://github.com/apollographql/router/tree/[^/]+/helm/chart/router",
+            format!("https://github.com/apollographql/router/tree/v{version}/helm/chart/router")
         );
         let helm_chart = String::from_utf8(
             std::process::Command::new(which::which("helm")?)
@@ -435,9 +300,9 @@ impl Prepare {
                     "--set",
                     "router.configuration.telemetry.metrics.prometheus.enabled=true",
                     "--set",
-                    "managedFederation.apiKey=\"REDACTED\"",
+                    "managedFederation.apiKey=REDACTED",
                     "--set",
-                    "managedFederation.graphRef=\"REDACTED\"",
+                    "managedFederation.graphRef=REDACTED",
                     "--debug",
                     ".",
                 ])
@@ -458,6 +323,19 @@ impl Prepare {
     ///   (If not installed, you should [install `helm-docs`](https://github.com/norwoodj/helm-docs))
     fn update_helm_charts(&self, version: &str) -> Result<()> {
         println!("updating helm charts");
+
+        replace_in_file!(
+            "./helm/chart/router/Chart.yaml",
+            "^version:.*?$",
+            format!("version: {version}")
+        );
+
+        replace_in_file!(
+            "./helm/chart/router/Chart.yaml",
+            "appVersion: \"v[^\"]+\"",
+            format!("appVersion: \"v{version}\"")
+        );
+
         if !std::process::Command::new(which::which("helm-docs")?)
             .current_dir("./helm/chart")
             .args(["helm-docs", "router"])
@@ -466,12 +344,6 @@ impl Prepare {
         {
             return Err(anyhow!("failed to generate helm docs"));
         }
-
-        replace_in_file!(
-            "./helm/chart/router/Chart.yaml",
-            "appVersion: \"v\\d+.\\d+.\\d+\"",
-            format!("appVersion: \"v{}\"", version)
-        );
 
         Ok(())
     }
@@ -487,8 +359,8 @@ impl Prepare {
             {
                 replace_in_file!(
                     entry.path(),
-                    r"ghcr.io/apollographql/router:v\d+.\d+.\d+",
-                    format!("ghcr.io/apollographql/router:v{}", version)
+                    r#"^(?P<indentation>\s+)image:\s*ghcr.io/apollographql/router:v.*$"#,
+                    format!("${{indentation}}image: ghcr.io/apollographql/router:v{version}")
                 );
             }
         }
@@ -501,28 +373,25 @@ impl Prepare {
     /// Clear `NEXT_CHANGELOG.md` leaving only the template.
     fn finalize_changelog(&self, version: &str) -> Result<()> {
         println!("finalizing changelog");
-        let next_changelog = std::fs::read_to_string("./NEXT_CHANGELOG.md")?;
         let changelog = std::fs::read_to_string("./CHANGELOG.md")?;
-        let changes_regex =
-            regex::Regex::new(r"(?ms)(.*# \[x.x.x\] \(unreleased\) - ....-mm-dd\n)(.*)")?;
-        let captures = changes_regex
-            .captures(&next_changelog)
-            .expect("changelog format was unexpected");
-        let template = captures
-            .get(1)
-            .expect("changelog format was unexpected")
-            .as_str();
-        let changes = captures
-            .get(2)
-            .expect("changelog format was unexpected")
-            .as_str();
 
-        let update_regex = regex::Regex::new(
-            r"(?ms)This project adheres to \[Semantic Versioning v2.0.0\]\(https://semver.org/spec/v2.0.0.html\).\n",
-        )?;
-        let updated = update_regex.replace(&changelog, format!("This project adheres to [Semantic Versioning v2.0.0](https://semver.org/spec/v2.0.0.html).\n\n# [{}] - {}\n{}\n", version, chrono::Utc::now().date_naive(), changes));
+        let semver_heading = "This project adheres to [Semantic Versioning v2.0.0](https://semver.org/spec/v2.0.0.html).";
+
+        let new_changelog = slurp_and_remove_changesets();
+
+        let update_regex =
+            regex::Regex::new(format!("(?ms){}\n", regex::escape(semver_heading)).as_str())?;
+        let updated = update_regex.replace(
+            &changelog,
+            format!(
+                "{}\n\n# [{}] - {}\n\n{}\n",
+                semver_heading,
+                version,
+                chrono::Utc::now().date_naive(),
+                &new_changelog,
+            ),
+        );
         std::fs::write("./CHANGELOG.md", updated.to_string())?;
-        std::fs::write("./NEXT_CHANGELOG.md", template.to_string())?;
         Ok(())
     }
     /// Update the license list with `cargo about generate --workspace -o licenses.html about.hbs`.
@@ -530,16 +399,10 @@ impl Prepare {
     /// Run `cargo xtask check-compliance`.
     fn check_compliance(&self) -> Result<()> {
         println!("checking compliance");
-        cargo!([
-            "about",
-            "generate",
-            "--workspace",
-            "-o",
-            "licenses.html",
-            "about.hbs"
-        ]);
-        if !self.skip_license_ckeck {
-            cargo!(["xtask", "check-compliance"]);
+        cargo!(["xtask", "check-compliance"]);
+        if !self.skip_license_check {
+            println!("updating licenses.html");
+            cargo!(["xtask", "licenses"]);
         }
         Ok(())
     }
@@ -550,44 +413,44 @@ impl Prepare {
         cargo!(["check"]);
         Ok(())
     }
+}
 
-    /// Create the release PR
-    async fn create_release_pr(&self, github: &Client, version: &str) -> Result<()> {
-        let git = which::which("git")?;
-        let result = std::process::Command::new(git)
-            .args(["branch", "--show-current"])
-            .output()?;
-        if !result.status.success() {
-            return Err(anyhow!("failed to get git current branch"));
+struct PreVerify();
+
+impl PreVerify {
+    fn run() -> Result<()> {
+        let version = format!("v{}", *PKG_VERSION);
+
+        // Get the git tag name as a string
+        let tags_output = std::process::Command::new("git")
+            .args(["describe", "--tags", "--exact-match"])
+            .output()
+            .map_err(|e| {
+                anyhow!(
+                    "failed to execute 'git describe --tags --exact-match': {}",
+                    e
+                )
+            })?
+            .stdout;
+        let tags_raw = String::from_utf8_lossy(&tags_output);
+        let tags_list = tags_raw
+            .split("\n")
+            .filter(|s| !s.trim().is_empty())
+            .collect::<Vec<_>>();
+
+        // If the tags contains the version, then we're good
+        if tags_list.is_empty() {
+            return Err(anyhow!(
+                "release cannot be performed because current git tree is not tagged"
+            ));
         }
-        let current_branch = String::from_utf8(result.stdout)?;
-
-        println!("creating release PR");
-        git!("add", "-u");
-        git!("commit", "-m", &format!("release {}", version));
-        git!(
-            "push",
-            "--set-upstream",
-            "origin",
-            &format!("{}:{}", current_branch.trim(), version)
-        );
-        github
-            .pulls()
-            .create(
-                "apollographql",
-                "router",
-                &PullsCreateRequest {
-                    base: "main".to_string(),
-                    body: format!("Release {}", version),
-                    draft: None,
-                    head: version.to_string(),
-                    issue: 0,
-                    maintainer_can_modify: None,
-                    title: format!("Release {}", version),
-                },
-            )
-            .await
-            .tap_err(|_| eprintln!("failed to create release PR"))?;
+        if !tags_list.contains(&version.as_str()) {
+            return Err(anyhow!(
+                "the git tree tags {{{}}} does not contain the version {} from the Cargo.toml",
+                tags_list.join(", "),
+                version
+            ));
+        }
         Ok(())
     }
 }

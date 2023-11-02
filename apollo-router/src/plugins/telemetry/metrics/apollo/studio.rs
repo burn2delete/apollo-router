@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::ops::Add;
 use std::ops::AddAssign;
 use std::time::Duration;
 
@@ -7,6 +6,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use super::duration_histogram::DurationHistogram;
+use crate::plugins::telemetry::apollo::LicensedOperationCountByType;
 use crate::plugins::telemetry::apollo_exporter::proto::reports::ReferencedFieldsForType;
 use crate::plugins::telemetry::apollo_exporter::proto::reports::StatsContext;
 
@@ -14,7 +14,7 @@ use crate::plugins::telemetry::apollo_exporter::proto::reports::StatsContext;
 pub(crate) struct SingleStatsReport {
     pub(crate) request_id: Uuid,
     pub(crate) stats: HashMap<String, SingleStats>,
-    pub(crate) operation_count: u64,
+    pub(crate) licensed_operation_count_by_type: Option<LicensedOperationCountByType>,
 }
 
 #[derive(Default, Debug, Serialize)]
@@ -29,37 +29,12 @@ pub(crate) struct Stats {
     pub(crate) referenced_fields_by_type: HashMap<String, ReferencedFieldsForType>,
 }
 
-impl Add<SingleStats> for SingleStats {
-    type Output = Stats;
-
-    fn add(self, rhs: SingleStats) -> Self::Output {
-        Stats {
-            stats_with_context: self.stats_with_context + rhs.stats_with_context,
-            // No merging required here because references fields by type will always be the same for each stats report key.
-            referenced_fields_by_type: rhs.referenced_fields_by_type,
-        }
-    }
-}
-
 #[derive(Default, Debug, Serialize)]
 pub(crate) struct SingleContextualizedStats {
     pub(crate) context: StatsContext,
     pub(crate) query_latency_stats: SingleQueryLatencyStats,
     pub(crate) per_type_stat: HashMap<String, SingleTypeStat>,
 }
-
-impl Add<SingleContextualizedStats> for SingleContextualizedStats {
-    type Output = ContextualizedStats;
-
-    fn add(self, stats: SingleContextualizedStats) -> Self::Output {
-        let mut res = ContextualizedStats::default();
-        res += self;
-        res += stats;
-
-        res
-    }
-}
-
 // TODO Make some of these fields bool
 #[derive(Default, Debug, Serialize)]
 pub(crate) struct SingleQueryLatencyStats {
@@ -74,17 +49,6 @@ pub(crate) struct SingleQueryLatencyStats {
     pub(crate) registered_operation: bool,
     pub(crate) forbidden_operation: bool,
     pub(crate) without_field_instrumentation: bool,
-}
-
-impl Add<SingleQueryLatencyStats> for SingleQueryLatencyStats {
-    type Output = QueryLatencyStats;
-    fn add(self, stats: SingleQueryLatencyStats) -> Self::Output {
-        let mut res = QueryLatencyStats::default();
-        res += self;
-        res += stats;
-
-        res
-    }
 }
 
 #[derive(Default, Debug, Serialize)]
@@ -103,12 +67,16 @@ pub(crate) struct SingleTypeStat {
 pub(crate) struct SingleFieldStat {
     pub(crate) return_type: String,
     pub(crate) errors_count: u64,
-    pub(crate) estimated_execution_count: f64,
     pub(crate) requests_with_errors_count: u64,
-    pub(crate) latency: Duration,
+
+    // Floating-point estimates that compensate for the sampling rate,
+    // rounded to integers when converting to Protobuf after aggregating
+    // a number of requests.
+    pub(crate) observed_execution_count: u64,
+    pub(crate) latency: DurationHistogram<f64>,
 }
 
-#[derive(Default, Debug, Serialize)]
+#[derive(Clone, Default, Debug, Serialize)]
 pub(crate) struct ContextualizedStats {
     context: StatsContext,
     query_latency_stats: QueryLatencyStats,
@@ -125,7 +93,7 @@ impl AddAssign<SingleContextualizedStats> for ContextualizedStats {
     }
 }
 
-#[derive(Default, Debug, Serialize)]
+#[derive(Clone, Default, Debug, Serialize)]
 pub(crate) struct QueryLatencyStats {
     request_latencies: DurationHistogram,
     persisted_query_hits: u64,
@@ -162,7 +130,7 @@ impl AddAssign<SingleQueryLatencyStats> for QueryLatencyStats {
     }
 }
 
-#[derive(Default, Debug, Serialize)]
+#[derive(Clone, Default, Debug, Serialize)]
 pub(crate) struct PathErrorStats {
     children: HashMap<String, PathErrorStats>,
     errors_count: u64,
@@ -179,7 +147,7 @@ impl AddAssign<SinglePathErrorStats> for PathErrorStats {
     }
 }
 
-#[derive(Default, Debug, Serialize)]
+#[derive(Clone, Default, Debug, Serialize)]
 pub(crate) struct TypeStat {
     per_field_stat: HashMap<String, FieldStat>,
 }
@@ -192,20 +160,23 @@ impl AddAssign<SingleTypeStat> for TypeStat {
     }
 }
 
-#[derive(Default, Debug, Serialize)]
+#[derive(Clone, Default, Debug, Serialize)]
 pub(crate) struct FieldStat {
     return_type: String,
     errors_count: u64,
-    estimated_execution_count: f64,
     requests_with_errors_count: u64,
-    latency: DurationHistogram,
+    observed_execution_count: u64,
+    // Floating-point estimates that compensate for the sampling rate,
+    // rounded to integers when converting to Protobuf after aggregating
+    // a number of requests.
+    latency: DurationHistogram<f64>,
 }
 
 impl AddAssign<SingleFieldStat> for FieldStat {
     fn add_assign(&mut self, stat: SingleFieldStat) {
-        self.latency.increment_duration(Some(stat.latency), 1);
+        self.latency += stat.latency;
         self.requests_with_errors_count += stat.requests_with_errors_count;
-        self.estimated_execution_count += stat.estimated_execution_count;
+        self.observed_execution_count += stat.observed_execution_count;
         self.errors_count += stat.errors_count;
         self.return_type = stat.return_type;
     }
@@ -232,16 +203,16 @@ impl From<QueryLatencyStats>
 {
     fn from(stats: QueryLatencyStats) -> Self {
         Self {
-            latency_count: stats.request_latencies.buckets,
-            request_count: stats.request_latencies.entries,
-            cache_hits: stats.cache_hits.entries,
-            cache_latency_count: stats.cache_hits.buckets,
+            request_count: stats.request_latencies.total,
+            latency_count: stats.request_latencies.buckets_to_i64(),
+            cache_hits: stats.cache_hits.total,
+            cache_latency_count: stats.cache_hits.buckets_to_i64(),
             persisted_query_hits: stats.persisted_query_hits,
             persisted_query_misses: stats.persisted_query_misses,
             root_error_stats: Some(stats.root_error_stats.into()),
             requests_with_errors_count: stats.requests_with_errors_count,
-            public_cache_ttl_count: stats.public_cache_ttl_count.buckets,
-            private_cache_ttl_count: stats.private_cache_ttl_count.buckets,
+            public_cache_ttl_count: stats.public_cache_ttl_count.buckets_to_i64(),
+            private_cache_ttl_count: stats.private_cache_ttl_count.buckets_to_i64(),
             registered_operation_count: stats.registered_operation_count,
             forbidden_operation_count: stats.forbidden_operation_count,
             requests_without_field_instrumentation: stats.requests_without_field_instrumentation,
@@ -282,10 +253,12 @@ impl From<FieldStat> for crate::plugins::telemetry::apollo_exporter::proto::repo
         Self {
             return_type: stat.return_type,
             errors_count: stat.errors_count,
-            observed_execution_count: stat.latency.entries,
-            estimated_execution_count: stat.estimated_execution_count as u64,
             requests_with_errors_count: stat.requests_with_errors_count,
-            latency_count: stat.latency.buckets,
+
+            observed_execution_count: stat.observed_execution_count,
+            // Round sampling-rate-compensated floating-point estimates to nearest integers:
+            estimated_execution_count: stat.latency.total as u64,
+            latency_count: stat.latency.buckets_to_i64(),
         }
     }
 }
@@ -297,13 +270,13 @@ mod test {
 
     use super::*;
     use crate::plugins::telemetry::apollo::Report;
+    use crate::query_planner::OperationKind;
 
     #[test]
     fn test_aggregation() {
         let metric_1 = create_test_metric("client_1", "version_1", "report_key_1");
         let metric_2 = create_test_metric("client_1", "version_1", "report_key_1");
         let aggregated_metrics = Report::new(vec![metric_1, metric_2]);
-
         insta::with_settings!({sort_maps => true}, {
             insta::assert_json_snapshot!(aggregated_metrics);
         });
@@ -345,7 +318,12 @@ mod test {
 
         SingleStatsReport {
             request_id: Uuid::default(),
-            operation_count: count.inc_u64(),
+            licensed_operation_count_by_type: LicensedOperationCountByType {
+                r#type: OperationKind::Query,
+                subtype: None,
+                licensed_operation_count: count.inc_u64(),
+            }
+            .into(),
             stats: HashMap::from([(
                 stats_report_key.to_string(),
                 SingleStats {
@@ -353,6 +331,8 @@ mod test {
                         context: StatsContext {
                             client_name: client_name.to_string(),
                             client_version: client_version.to_string(),
+                            operation_type: String::new(),
+                            operation_subtype: String::new(),
                         },
                         query_latency_stats: SingleQueryLatencyStats {
                             latency: Duration::from_secs(1),
@@ -419,12 +399,14 @@ mod test {
     }
 
     fn field_stat(count: &mut Count) -> SingleFieldStat {
+        let mut latency = DurationHistogram::default();
+        latency.increment_duration(Some(Duration::from_secs(1)), 1.0);
         SingleFieldStat {
             return_type: "String".into(),
             errors_count: count.inc_u64(),
-            estimated_execution_count: count.inc_f64(),
+            observed_execution_count: count.inc_u64(),
             requests_with_errors_count: count.inc_u64(),
-            latency: Duration::from_secs(1),
+            latency,
         }
     }
 
@@ -436,10 +418,6 @@ mod test {
         fn inc_u64(&mut self) -> u64 {
             self.count += 1;
             self.count
-        }
-        fn inc_f64(&mut self) -> f64 {
-            self.count += 1;
-            self.count as f64
         }
     }
 }

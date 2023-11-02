@@ -6,11 +6,11 @@
 //! * Compression
 //! * Rate limiting
 //!
-
+pub(crate) mod cache;
 mod deduplication;
-mod rate;
+pub(crate) mod rate;
 mod retry;
-mod timeout;
+pub(crate) mod timeout;
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -18,7 +18,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use http::header::ACCEPT_ENCODING;
 use http::header::CONTENT_ENCODING;
 use http::HeaderValue;
 use schemars::JsonSchema;
@@ -31,12 +30,15 @@ use tower::Service;
 use tower::ServiceBuilder;
 use tower::ServiceExt;
 
+use self::cache::SubgraphCacheLayer;
 use self::deduplication::QueryDeduplicationLayer;
 use self::rate::RateLimitLayer;
 pub(crate) use self::rate::RateLimited;
-use self::retry::RetryPolicy;
+pub(crate) use self::retry::RetryPolicy;
 pub(crate) use self::timeout::Elapsed;
 use self::timeout::TimeoutLayer;
+use crate::cache::redis::RedisCacheStorage;
+use crate::configuration::RedisCache;
 use crate::error::ConfigurationError;
 use crate::plugin::Plugin;
 use crate::plugin::PluginInit;
@@ -44,8 +46,7 @@ use crate::register_plugin;
 use crate::services::subgraph;
 use crate::services::subgraph_service::Compression;
 use crate::services::supergraph;
-use crate::Configuration;
-use crate::SubgraphRequest;
+use crate::services::SubgraphRequest;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const APOLLO_TRAFFIC_SHAPING: &str = "apollo.traffic_shaping";
@@ -54,6 +55,7 @@ trait Merge {
     fn merge(&self, fallback: Option<&Self>) -> Self;
 }
 
+/// Traffic shaping options
 #[derive(PartialEq, Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Shaping {
@@ -67,8 +69,23 @@ struct Shaping {
     #[schemars(with = "String", default)]
     /// Enable timeout for incoming requests
     timeout: Option<Duration>,
+    /// Retry configuration
     //  *experimental feature*: Enables request retry
     experimental_retry: Option<RetryConfig>,
+    /// Enable HTTP2 for subgraphs
+    experimental_http2: Option<Http2Config>,
+}
+
+#[derive(PartialEq, Default, Debug, Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Http2Config {
+    #[default]
+    /// Enable HTTP2 for subgraphs
+    Enable,
+    /// Disable HTTP2 for subgraphs
+    Disable,
+    /// Only HTTP2 is active
+    Http2Only,
 }
 
 impl Merge for Shaping {
@@ -89,11 +106,17 @@ impl Merge for Shaping {
                     .as_ref()
                     .or(fallback.experimental_retry.as_ref())
                     .cloned(),
+                experimental_http2: self
+                    .experimental_http2
+                    .as_ref()
+                    .or(fallback.experimental_http2.as_ref())
+                    .cloned(),
             },
         }
     }
 }
 
+/// Retry configuration
 #[derive(PartialEq, Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RetryConfig {
@@ -129,6 +152,50 @@ impl Merge for RetryConfig {
     }
 }
 
+// this is a wrapper struct to add subgraph specific options over Shaping
+#[derive(PartialEq, Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SubgraphShaping {
+    #[serde(flatten)]
+    shaping: Shaping,
+    /// Enable entity caching
+    experimental_entity_caching: Option<SubgraphEntityCaching>,
+}
+
+impl Merge for SubgraphShaping {
+    fn merge(&self, fallback: Option<&Self>) -> Self {
+        match fallback {
+            None => self.clone(),
+            Some(fallback) => SubgraphShaping {
+                shaping: self.shaping.merge(Some(&fallback.shaping)),
+                experimental_entity_caching: self
+                    .experimental_entity_caching
+                    .as_ref()
+                    .or(fallback.experimental_entity_caching.as_ref())
+                    .cloned(),
+            },
+        }
+    }
+}
+
+#[derive(PartialEq, Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SubgraphEntityCaching {
+    /// expiration for all keys
+    #[serde(deserialize_with = "humantime_serde::deserialize")]
+    #[schemars(with = "String")]
+    pub(crate) ttl: Duration,
+}
+
+impl Merge for SubgraphEntityCaching {
+    fn merge(&self, fallback: Option<&Self>) -> Self {
+        match fallback {
+            None => self.clone(),
+            Some(fallback) => fallback.clone(),
+        }
+    }
+}
+
 #[derive(PartialEq, Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RouterShaping {
@@ -140,23 +207,22 @@ struct RouterShaping {
     timeout: Option<Duration>,
 }
 
-#[derive(PartialEq, Debug, Clone, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-
+#[derive(PartialEq, Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
 // FIXME: This struct is pub(crate) because we need its configuration in the query planner service.
 // Remove this once the configuration yml changes.
+/// Configuration for the experimental traffic shaping plugin
 pub(crate) struct Config {
-    #[serde(default)]
     /// Applied at the router level
     router: Option<RouterShaping>,
-    #[serde(default)]
     /// Applied on all subgraphs
-    all: Option<Shaping>,
-    #[serde(default)]
+    all: Option<SubgraphShaping>,
     /// Applied on specific subgraphs
-    subgraphs: HashMap<String, Shaping>,
-    /// Enable variable deduplication optimization when sending requests to subgraphs (https://github.com/apollographql/router/issues/87)
+    subgraphs: HashMap<String, SubgraphShaping>,
+    /// DEPRECATED, now always enabled: Enable variable deduplication optimization when sending requests to subgraphs (https://github.com/apollographql/router/issues/87)
     deduplicate_variables: Option<bool>,
+    /// Experimental URLs of Redis cache used for subgraph response caching
+    pub(crate) experimental_cache: Option<RedisCache>,
 }
 
 #[derive(PartialEq, Debug, Clone, Deserialize, JsonSchema)]
@@ -188,6 +254,7 @@ pub(crate) struct TrafficShaping {
     config: Config,
     rate_limit_router: Option<RateLimitLayer>,
     rate_limit_subgraphs: Mutex<HashMap<String, RateLimitLayer>>,
+    storage: Option<RedisCacheStorage>,
 }
 
 #[async_trait::async_trait]
@@ -218,11 +285,34 @@ impl Plugin for TrafficShaping {
             })
             .transpose()?;
 
-        Ok(Self {
-            config: init.config,
-            rate_limit_router,
-            rate_limit_subgraphs: Mutex::new(HashMap::new()),
-        })
+        {
+            let storage = if let Some(urls) = init
+                .config
+                .experimental_cache
+                .as_ref()
+                .map(|cache| cache.urls.clone())
+            {
+                Some(
+                    RedisCacheStorage::new(
+                        urls,
+                        None,
+                        init.config
+                            .experimental_cache
+                            .as_ref()
+                            .and_then(|c| c.timeout),
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            Ok(Self {
+                config: init.config,
+                rate_limit_router,
+                rate_limit_subgraphs: Mutex::new(HashMap::new()),
+                storage,
+            })
+        }
     }
 }
 
@@ -277,16 +367,19 @@ impl TrafficShaping {
         subgraph::Request,
         Response = subgraph::Response,
         Error = BoxError,
-        Future = tower::util::Either<
-            tower::util::Either<
+        Future = Either<
+            Either<
                 BoxFuture<'static, Result<subgraph::Response, BoxError>>,
-                timeout::future::ResponseFuture<
-                    Oneshot<
-                        tower::util::Either<
-                            Retry<RetryPolicy, tower::util::Either<rate::service::RateLimit<S>, S>>,
-                            tower::util::Either<rate::service::RateLimit<S>, S>,
+                Either<
+                    BoxFuture<'static, Result<subgraph::Response, BoxError>>,
+                    timeout::future::ResponseFuture<
+                        Oneshot<
+                            Either<
+                                Retry<RetryPolicy, Either<rate::service::RateLimit<S>, S>>,
+                                Either<rate::service::RateLimit<S>, S>,
+                            >,
+                            subgraph::Request,
                         >,
-                        subgraph::Request,
                     >,
                 >,
             >,
@@ -308,35 +401,56 @@ impl TrafficShaping {
         let all_config = self.config.all.as_ref();
         let subgraph_config = self.config.subgraphs.get(name);
         let final_config = Self::merge_config(all_config, subgraph_config);
+        let entity_caching = if let (Some(storage), Some(caching_config)) = (
+            self.storage.clone(),
+            final_config
+                .as_ref()
+                .and_then(|c| c.experimental_entity_caching.as_ref()),
+        ) {
+            Some(SubgraphCacheLayer::new_with_storage(
+                name.to_string(),
+                storage,
+                caching_config.ttl,
+            ))
+        } else {
+            None
+        };
 
         if let Some(config) = final_config {
-            let rate_limit = config.global_rate_limit.as_ref().map(|rate_limit_conf| {
-                self.rate_limit_subgraphs
-                    .lock()
-                    .unwrap()
-                    .entry(name.to_string())
-                    .or_insert_with(|| {
-                        RateLimitLayer::new(rate_limit_conf.capacity, rate_limit_conf.interval)
-                    })
-                    .clone()
-            });
+            let rate_limit = config
+                .shaping
+                .global_rate_limit
+                .as_ref()
+                .map(|rate_limit_conf| {
+                    self.rate_limit_subgraphs
+                        .lock()
+                        .unwrap()
+                        .entry(name.to_string())
+                        .or_insert_with(|| {
+                            RateLimitLayer::new(rate_limit_conf.capacity, rate_limit_conf.interval)
+                        })
+                        .clone()
+                });
 
-            let retry = config.experimental_retry.as_ref().map(|config| {
+            let retry = config.shaping.experimental_retry.as_ref().map(|config| {
                 let retry_policy = RetryPolicy::new(
                     config.ttl,
                     config.min_per_sec,
                     config.retry_percent,
                     config.retry_mutations,
+                    name.to_string(),
                 );
                 tower::retry::RetryLayer::new(retry_policy)
             });
 
             Either::A(ServiceBuilder::new()
-                .option_layer(config.deduplicate_query.unwrap_or_default().then(
+            .option_layer(entity_caching)
+
+                .option_layer(config.shaping.deduplicate_query.unwrap_or_default().then(
                   QueryDeduplicationLayer::default
                 ))
                     .layer(TimeoutLayer::new(
-                        config
+                        config.shaping
                         .timeout
                         .unwrap_or(DEFAULT_TIMEOUT),
                     ))
@@ -344,9 +458,8 @@ impl TrafficShaping {
                     .option_layer(rate_limit)
                 .service(service)
                 .map_request(move |mut req: SubgraphRequest| {
-                    if let Some(compression) = config.compression {
+                    if let Some(compression) = config.shaping.compression {
                         let compression_header_val = HeaderValue::from_str(&compression.to_string()).expect("compression is manually implemented and already have the right values; qed");
-                        req.subgraph_request.headers_mut().insert(ACCEPT_ENCODING, HeaderValue::from_static("gzip, br, deflate"));
                         req.subgraph_request.headers_mut().insert(CONTENT_ENCODING, compression_header_val);
                     }
 
@@ -356,14 +469,14 @@ impl TrafficShaping {
             Either::B(service)
         }
     }
-}
 
-impl TrafficShaping {
-    pub(crate) fn get_configuration_deduplicate_variables(configuration: &Configuration) -> bool {
-        configuration
-            .plugin_configuration(APOLLO_TRAFFIC_SHAPING)
-            .map(|conf| conf.get("deduplicate_variables") == Some(&serde_json::Value::Bool(true)))
-            .unwrap_or_default()
+    pub(crate) fn enable_subgraph_http2(&self, service_name: &str) -> Http2Config {
+        Self::merge_config(
+            self.config.all.as_ref(),
+            self.config.subgraphs.get(service_name),
+        )
+        .and_then(|config| config.shaping.experimental_http2)
+        .unwrap_or(Http2Config::Enable)
     }
 }
 
@@ -385,14 +498,17 @@ mod test {
     use crate::plugin::test::MockSubgraph;
     use crate::plugin::test::MockSupergraphService;
     use crate::plugin::DynPlugin;
+    use crate::query_planner::BridgeQueryPlanner;
     use crate::router_factory::create_plugins;
+    use crate::services::layers::persisted_queries::PersistedQueryLayer;
+    use crate::services::layers::query_analysis::QueryAnalysisLayer;
     use crate::services::router;
     use crate::services::router_service::RouterCreator;
+    use crate::services::HasSchema;
+    use crate::services::PluggableSupergraphServiceBuilder;
+    use crate::services::SupergraphRequest;
+    use crate::services::SupergraphResponse;
     use crate::Configuration;
-    use crate::PluggableSupergraphServiceBuilder;
-    use crate::Schema;
-    use crate::SupergraphRequest;
-    use crate::SupergraphResponse;
 
     static EXPECTED_RESPONSE: Lazy<Bytes> = Lazy::new(|| {
         Bytes::from_static(r#"{"data":{"topProducts":[{"upc":"1","name":"Table","reviews":[{"id":"1","product":{"name":"Table"},"author":{"id":"1","name":"Ada Lovelace"}},{"id":"4","product":{"name":"Table"},"author":{"id":"2","name":"Alan Turing"}}]},{"upc":"2","name":"Couch","reviews":[{"id":"2","product":{"name":"Couch"},"author":{"id":"1","name":"Ada Lovelace"}}]}]}}"#.as_bytes())
@@ -466,7 +582,6 @@ mod test {
         let schema = include_str!(
             "../../../../apollo-router-benchmarks/benches/fixtures/supergraph.graphql"
         );
-        let schema: Arc<Schema> = Arc::new(Schema::parse(schema, &Default::default()).unwrap());
 
         let config: Configuration = serde_yaml::from_str(
             r#"
@@ -477,9 +592,13 @@ mod test {
         .unwrap();
 
         let config = Arc::new(config);
+        let planner = BridgeQueryPlanner::new(schema.to_string(), config.clone())
+            .await
+            .unwrap();
+        let schema = planner.schema();
 
-        let mut builder = PluggableSupergraphServiceBuilder::new(schema.clone())
-            .with_configuration(config.clone());
+        let mut builder =
+            PluggableSupergraphServiceBuilder::new(planner).with_configuration(config.clone());
 
         for (name, plugin) in create_plugins(
             &config,
@@ -498,10 +617,16 @@ mod test {
             .with_subgraph_service("reviews", review_service.clone())
             .with_subgraph_service("products", product_service.clone());
 
+        let supergraph_creator = builder.build().await.expect("should build");
+
         RouterCreator::new(
-            Arc::new(builder.build().await.expect("should build")),
-            &Configuration::default(),
+            QueryAnalysisLayer::new(supergraph_creator.schema(), Default::default()).await,
+            Arc::new(PersistedQueryLayer::new(&Default::default()).await.unwrap()),
+            Arc::new(supergraph_creator),
+            Arc::new(Configuration::default()),
         )
+        .await
+        .unwrap()
         .make()
         .boxed()
     }
@@ -552,13 +677,6 @@ mod test {
                     .unwrap(),
                 HeaderValue::from_static("gzip")
             );
-            assert_eq!(
-                req.subgraph_request
-                    .headers()
-                    .get(&ACCEPT_ENCODING)
-                    .unwrap(),
-                HeaderValue::from_static("gzip, br, deflate")
-            );
 
             req
         });
@@ -603,6 +721,75 @@ mod test {
         );
     }
 
+    #[test]
+    fn test_merge_http2_all() {
+        let config = serde_yaml::from_str::<Config>(
+            r#"
+        all:
+          experimental_http2: disable
+        subgraphs: 
+          products:
+            experimental_http2: enable
+          reviews:
+            experimental_http2: disable
+        router:
+          timeout: 65s
+        "#,
+        )
+        .unwrap();
+
+        assert!(
+            TrafficShaping::merge_config(config.all.as_ref(), config.subgraphs.get("products"))
+                .unwrap()
+                .shaping
+                .experimental_http2
+                .unwrap()
+                == Http2Config::Enable
+        );
+        assert!(
+            TrafficShaping::merge_config(config.all.as_ref(), config.subgraphs.get("reviews"))
+                .unwrap()
+                .shaping
+                .experimental_http2
+                .unwrap()
+                == Http2Config::Disable
+        );
+        assert!(
+            TrafficShaping::merge_config(config.all.as_ref(), None)
+                .unwrap()
+                .shaping
+                .experimental_http2
+                .unwrap()
+                == Http2Config::Disable
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enable_subgraph_http2() {
+        let config = serde_yaml::from_str::<Config>(
+            r#"
+        all:
+          experimental_http2: disable
+        subgraphs: 
+          products:
+            experimental_http2: enable
+          reviews:
+            experimental_http2: disable
+        router:
+          timeout: 65s
+        "#,
+        )
+        .unwrap();
+
+        let shaping_config = TrafficShaping::new(PluginInit::fake_builder().config(config).build())
+            .await
+            .unwrap();
+
+        assert!(shaping_config.enable_subgraph_http2("products") == Http2Config::Enable);
+        assert!(shaping_config.enable_subgraph_http2("reviews") == Http2Config::Disable);
+        assert!(shaping_config.enable_subgraph_http2("this_doesnt_exist") == Http2Config::Disable);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn it_rate_limit_subgraph_requests() {
         let config = serde_yaml::from_str::<serde_json::Value>(
@@ -645,11 +832,7 @@ mod test {
             .oneshot(SubgraphRequest::fake_builder().build())
             .await
             .unwrap();
-        // Note: use `timeout` to guarantee 300ms has elapsed
-        let big_sleep = tokio::time::sleep(Duration::from_secs(10));
-        assert!(tokio::time::timeout(Duration::from_millis(300), big_sleep)
-            .await
-            .is_err());
+        tokio::time::sleep(Duration::from_millis(300)).await;
         let _response = plugin
             .as_any()
             .downcast_ref::<TrafficShaping>()
@@ -667,7 +850,7 @@ mod test {
         router:
             global_rate_limit:
                 capacity: 1
-                interval: 300ms
+                interval: 100ms
             timeout: 500ms
         "#,
         )
@@ -711,11 +894,7 @@ mod test {
             .oneshot(SupergraphRequest::fake_builder().build().unwrap())
             .await
             .is_err());
-        // Note: use `timeout` to guarantee 300ms has elapsed
-        let big_sleep = tokio::time::sleep(Duration::from_secs(10));
-        assert!(tokio::time::timeout(Duration::from_millis(300), big_sleep)
-            .await
-            .is_err());
+        tokio::time::sleep(Duration::from_millis(300)).await;
         let _response = plugin
             .as_any()
             .downcast_ref::<TrafficShaping>()

@@ -1,22 +1,23 @@
 //! Configuration for the telemetry plugin.
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 
 use axum::headers::HeaderName;
-use opentelemetry::sdk::Resource;
+use opentelemetry::sdk::trace::SpanLimits;
 use opentelemetry::Array;
-use opentelemetry::KeyValue;
 use opentelemetry::Value;
 use regex::Regex;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde::Serialize;
 
 use super::metrics::MetricsAttributesConf;
 use super::*;
 use crate::configuration::ConfigurationError;
-use crate::plugin::serde::deserialize_header_name;
 use crate::plugin::serde::deserialize_option_header_name;
 use crate::plugin::serde::deserialize_regex;
 use crate::plugins::telemetry::metrics;
+use crate::plugins::telemetry::resource::ConfigResource;
 
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum Error {
@@ -48,76 +49,136 @@ where
 
 impl<T> GenericWith<T> for T where Self: Sized {}
 
+/// Telemetry configuration
 #[derive(Clone, Default, Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields, rename_all = "snake_case")]
-pub struct Conf {
-    #[serde(rename = "experimental_logging")]
-    pub(crate) logging: Option<Logging>,
-    pub(crate) metrics: Option<Metrics>,
-    pub(crate) tracing: Option<Tracing>,
-    pub(crate) apollo: Option<apollo::Config>,
+#[serde(deny_unknown_fields, default)]
+pub(crate) struct Conf {
+    /// Logging configuration
+    #[serde(rename = "experimental_logging", default)]
+    pub(crate) logging: Logging,
+
+    #[cfg(feature = "telemetry_next")]
+    #[serde(rename = "logging", default)]
+    #[allow(dead_code)]
+    pub(crate) new_logging: config_new::logging::Logging,
+    /// Metrics configuration
+    pub(crate) metrics: Metrics,
+    /// Tracing configuration
+    pub(crate) tracing: Tracing,
+    /// Apollo reporting configuration
+    pub(crate) apollo: apollo::Config,
+
+    #[cfg(feature = "telemetry_next")]
+    /// Event configuration
+    pub(crate) events: config_new::events::Events,
+    #[cfg(feature = "telemetry_next")]
+    /// Span configuration
+    pub(crate) spans: config_new::spans::Spans,
+    #[cfg(feature = "telemetry_next")]
+    /// Instrument configuration
+    pub(crate) instruments: config_new::instruments::Instruments,
 }
 
+/// Metrics configuration
 #[derive(Clone, Default, Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields, rename_all = "snake_case")]
-#[allow(dead_code)]
+#[serde(deny_unknown_fields, default)]
 pub(crate) struct Metrics {
-    pub(crate) common: Option<MetricsCommon>,
-    pub(crate) otlp: Option<otlp::Config>,
-    pub(crate) prometheus: Option<metrics::prometheus::Config>,
+    /// Common metrics configuration across all exporters
+    pub(crate) common: MetricsCommon,
+    /// Open Telemetry native exporter configuration
+    pub(crate) otlp: otlp::Config,
+    /// Prometheus exporter configuration
+    pub(crate) prometheus: metrics::prometheus::Config,
 }
 
-#[derive(Clone, Default, Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields, rename_all = "snake_case")]
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
 pub(crate) struct MetricsCommon {
     /// Configuration to add custom labels/attributes to metrics
-    pub(crate) attributes: Option<MetricsAttributesConf>,
+    pub(crate) attributes: MetricsAttributesConf,
     /// Set a service.name resource in your metrics
     pub(crate) service_name: Option<String>,
     /// Set a service.namespace attribute in your metrics
     pub(crate) service_namespace: Option<String>,
-    #[serde(default)]
-    /// Resources
-    pub(crate) resources: HashMap<String, String>,
+    /// The Open Telemetry resource
+    pub(crate) resource: BTreeMap<String, AttributeValue>,
+    /// Custom buckets for histograms
+    pub(crate) buckets: Vec<f64>,
+    /// Experimental metrics to know more about caching strategies
+    pub(crate) experimental_cache_metrics: ExperimentalCacheMetricsConf,
 }
 
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub(crate) struct ExperimentalCacheMetricsConf {
+    /// Enable experimental metrics
+    pub(crate) enabled: bool,
+    #[serde(with = "humantime_serde")]
+    #[schemars(with = "String")]
+    /// Potential TTL for a cache if we had one (default: 5secs)
+    pub(crate) ttl: Duration,
+}
+
+impl Default for ExperimentalCacheMetricsConf {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl: Duration::from_secs(5),
+        }
+    }
+}
+
+impl Default for MetricsCommon {
+    fn default() -> Self {
+        Self {
+            attributes: Default::default(),
+            service_name: None,
+            service_namespace: None,
+            resource: BTreeMap::new(),
+            buckets: vec![
+                0.001, 0.005, 0.015, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 1.0, 5.0, 10.0,
+            ],
+            experimental_cache_metrics: ExperimentalCacheMetricsConf::default(),
+        }
+    }
+}
+
+/// Tracing configuration
 #[derive(Clone, Default, Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields, rename_all = "snake_case")]
+#[serde(deny_unknown_fields, default)]
 pub(crate) struct Tracing {
     // TODO: when deleting the `experimental_` prefix, check the usage when enabling dev mode
     // When deleting, put a #[serde(alias = "experimental_response_trace_id")] if we don't want to break things
     /// A way to expose trace id in response headers
     #[serde(default, rename = "experimental_response_trace_id")]
     pub(crate) response_trace_id: ExposeTraceId,
-    pub(crate) propagation: Option<Propagation>,
-    pub(crate) trace_config: Option<Trace>,
-    pub(crate) otlp: Option<otlp::Config>,
-    pub(crate) jaeger: Option<tracing::jaeger::Config>,
-    pub(crate) zipkin: Option<tracing::zipkin::Config>,
-    pub(crate) datadog: Option<tracing::datadog::Config>,
+    /// Propagation configuration
+    pub(crate) propagation: Propagation,
+    /// Common configuration
+    pub(crate) common: Trace,
+    /// OpenTelemetry native exporter configuration
+    pub(crate) otlp: otlp::Config,
+    /// Jaeger exporter configuration
+    pub(crate) jaeger: tracing::jaeger::Config,
+    /// Zipkin exporter configuration
+    pub(crate) zipkin: tracing::zipkin::Config,
+    /// Datadog exporter configuration
+    pub(crate) datadog: tracing::datadog::Config,
 }
 
-#[derive(Clone, Default, Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields, default)]
 pub(crate) struct Logging {
     /// Log format
-    #[serde(default)]
     pub(crate) format: LoggingFormat,
-    #[serde(default = "default_display_filename")]
+    /// Display the target in the logs
+    pub(crate) display_target: bool,
+    /// Display the filename in the logs
     pub(crate) display_filename: bool,
-    #[serde(default = "default_display_line_number")]
+    /// Display the line number in the logs
     pub(crate) display_line_number: bool,
     /// Log configuration to log request and response for subgraphs and supergraph
-    #[serde(default)]
     pub(crate) when_header: Vec<HeaderLoggingCondition>,
-}
-
-pub(crate) const fn default_display_filename() -> bool {
-    true
-}
-
-pub(crate) const fn default_display_line_number() -> bool {
-    true
 }
 
 impl Logging {
@@ -161,7 +222,7 @@ pub(crate) enum HeaderLoggingCondition {
         /// Header name
         name: String,
         /// Regex to match the header value
-        #[schemars(schema_with = "string_schema", rename = "match")]
+        #[schemars(with = "String", rename = "match")]
         #[serde(deserialize_with = "deserialize_regex", rename = "match")]
         matching: Regex,
         /// Display request/response headers (default: false)
@@ -245,7 +306,7 @@ pub(crate) enum LoggingFormat {
 
 impl Default for LoggingFormat {
     fn default() -> Self {
-        if atty::is(atty::Stream::Stdout) {
+        if std::io::stdout().is_terminal() {
             Self::Pretty
         } else {
             Self::Json
@@ -254,7 +315,7 @@ impl Default for LoggingFormat {
 }
 
 #[derive(Clone, Default, Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields, rename_all = "snake_case")]
+#[serde(deny_unknown_fields, default)]
 pub(crate) struct ExposeTraceId {
     /// Expose the trace_id in response headers
     pub(crate) enabled: bool,
@@ -264,44 +325,84 @@ pub(crate) struct ExposeTraceId {
     pub(crate) header_name: Option<HeaderName>,
 }
 
+/// Configure propagation of traces. In general you won't have to do this as these are automatically configured
+/// along with any exporter you configure.
 #[derive(Clone, Default, Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields, rename_all = "snake_case")]
+#[serde(deny_unknown_fields, default)]
 pub(crate) struct Propagation {
     /// Select a custom request header to set your own trace_id (header value must be convertible from hexadecimal to set a correct trace_id)
-    pub(crate) request: Option<PropagationRequestTraceId>,
-    pub(crate) baggage: Option<bool>,
-    pub(crate) trace_context: Option<bool>,
-    pub(crate) jaeger: Option<bool>,
-    pub(crate) datadog: Option<bool>,
-    pub(crate) zipkin: Option<bool>,
+    pub(crate) request: RequestPropagation,
+    /// Propagate baggage https://www.w3.org/TR/baggage/
+    pub(crate) baggage: bool,
+    /// Propagate trace context https://www.w3.org/TR/trace-context/
+    pub(crate) trace_context: bool,
+    /// Propagate Jaeger
+    pub(crate) jaeger: bool,
+    /// Propagate Datadog
+    pub(crate) datadog: bool,
+    /// Propagate Zipkin
+    pub(crate) zipkin: bool,
+    /// Propagate AWS X-Ray
+    pub(crate) aws_xray: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields, rename_all = "snake_case")]
-pub(crate) struct PropagationRequestTraceId {
+#[derive(Clone, Debug, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RequestPropagation {
     /// Choose the header name to expose trace_id (default: apollo-trace-id)
     #[schemars(with = "String")]
-    #[serde(deserialize_with = "deserialize_header_name")]
-    pub(crate) header_name: HeaderName,
+    #[serde(deserialize_with = "deserialize_option_header_name")]
+    pub(crate) header_name: Option<HeaderName>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 #[non_exhaustive]
 pub(crate) struct Trace {
+    /// The trace service name
     pub(crate) service_name: Option<String>,
+    /// The trace service namespace
     pub(crate) service_namespace: Option<String>,
-    #[serde(default = "default_sampler")]
+    /// The sampler, always_on, always_off or a decimal between 0.0 and 1.0
     pub(crate) sampler: SamplerOption,
-    #[serde(default = "default_parent_based_sampler")]
+    /// Whether to use parent based sampling
     pub(crate) parent_based_sampler: bool,
-    pub(crate) max_events_per_span: Option<u32>,
-    pub(crate) max_attributes_per_span: Option<u32>,
-    pub(crate) max_links_per_span: Option<u32>,
-    pub(crate) max_attributes_per_event: Option<u32>,
-    pub(crate) max_attributes_per_link: Option<u32>,
-    #[serde(default)]
-    pub(crate) attributes: BTreeMap<String, AttributeValue>,
+    /// The maximum events per span before discarding
+    pub(crate) max_events_per_span: u32,
+    /// The maximum attributes per span before discarding
+    pub(crate) max_attributes_per_span: u32,
+    /// The maximum links per span before discarding
+    pub(crate) max_links_per_span: u32,
+    /// The maximum attributes per event before discarding
+    pub(crate) max_attributes_per_event: u32,
+    /// The maximum attributes per link before discarding
+    pub(crate) max_attributes_per_link: u32,
+    /// The Open Telemetry resource
+    pub(crate) resource: BTreeMap<String, AttributeValue>,
+}
+
+impl ConfigResource for Trace {
+    fn service_name(&self) -> Option<String> {
+        self.service_name.clone()
+    }
+    fn service_namespace(&self) -> Option<String> {
+        self.service_namespace.clone()
+    }
+    fn resource(&self) -> &BTreeMap<String, AttributeValue> {
+        &self.resource
+    }
+}
+
+impl ConfigResource for MetricsCommon {
+    fn service_name(&self) -> Option<String> {
+        self.service_name.clone()
+    }
+    fn service_namespace(&self) -> Option<String> {
+        self.service_namespace.clone()
+    }
+    fn resource(&self) -> &BTreeMap<String, AttributeValue> {
+        &self.resource
+    }
 }
 
 fn default_parent_based_sampler() -> bool {
@@ -315,21 +416,37 @@ fn default_sampler() -> SamplerOption {
 impl Default for Trace {
     fn default() -> Self {
         Self {
-            service_name: None,
-            service_namespace: None,
+            service_name: Default::default(),
+            service_namespace: Default::default(),
             sampler: default_sampler(),
             parent_based_sampler: default_parent_based_sampler(),
-            max_events_per_span: None,
-            max_attributes_per_span: None,
-            max_links_per_span: None,
-            max_attributes_per_event: None,
-            max_attributes_per_link: None,
-            attributes: Default::default(),
+            max_events_per_span: default_max_events_per_span(),
+            max_attributes_per_span: default_max_attributes_per_span(),
+            max_links_per_span: default_max_links_per_span(),
+            max_attributes_per_event: default_max_attributes_per_event(),
+            max_attributes_per_link: default_max_attributes_per_link(),
+            resource: Default::default(),
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+fn default_max_events_per_span() -> u32 {
+    SpanLimits::default().max_events_per_span
+}
+fn default_max_attributes_per_span() -> u32 {
+    SpanLimits::default().max_attributes_per_span
+}
+fn default_max_links_per_span() -> u32 {
+    SpanLimits::default().max_links_per_span
+}
+fn default_max_attributes_per_event() -> u32 {
+    SpanLimits::default().max_attributes_per_event
+}
+fn default_max_attributes_per_link() -> u32 {
+    SpanLimits::default().max_attributes_per_link
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(untagged, deny_unknown_fields)]
 pub(crate) enum AttributeValue {
     /// bool values
@@ -344,6 +461,54 @@ pub(crate) enum AttributeValue {
     Array(AttributeArray),
 }
 
+impl TryFrom<serde_json::Value> for AttributeValue {
+    type Error = ();
+    fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
+        match value {
+            serde_json::Value::Null => Err(()),
+            serde_json::Value::Bool(v) => Ok(AttributeValue::Bool(v)),
+            serde_json::Value::Number(v) if v.is_i64() => {
+                Ok(AttributeValue::I64(v.as_i64().expect("i64 checked")))
+            }
+            serde_json::Value::Number(v) if v.is_f64() => {
+                Ok(AttributeValue::F64(v.as_f64().expect("f64 checked")))
+            }
+            serde_json::Value::String(v) => Ok(AttributeValue::String(v)),
+            serde_json::Value::Array(v) => {
+                if v.iter().all(|v| v.is_boolean()) {
+                    Ok(AttributeValue::Array(AttributeArray::Bool(
+                        v.iter()
+                            .map(|v| v.as_bool().expect("all bools checked"))
+                            .collect(),
+                    )))
+                } else if v.iter().all(|v| v.is_f64()) {
+                    Ok(AttributeValue::Array(AttributeArray::F64(
+                        v.iter()
+                            .map(|v| v.as_f64().expect("all f64 checked"))
+                            .collect(),
+                    )))
+                } else if v.iter().all(|v| v.is_i64()) {
+                    Ok(AttributeValue::Array(AttributeArray::I64(
+                        v.iter()
+                            .map(|v| v.as_i64().expect("all i64 checked"))
+                            .collect(),
+                    )))
+                } else if v.iter().all(|v| v.is_string()) {
+                    Ok(AttributeValue::Array(AttributeArray::String(
+                        v.iter()
+                            .map(|v| v.as_str().expect("all strings checked").to_string())
+                            .collect(),
+                    )))
+                } else {
+                    Err(())
+                }
+            }
+            serde_json::Value::Object(_v) => Err(()),
+            _ => Err(()),
+        }
+    }
+}
+
 impl From<AttributeValue> for opentelemetry::Value {
     fn from(value: AttributeValue) -> Self {
         match value {
@@ -356,7 +521,7 @@ impl From<AttributeValue> for opentelemetry::Value {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(untagged, deny_unknown_fields)]
 pub(crate) enum AttributeArray {
     /// Array of bools
@@ -419,78 +584,23 @@ impl From<SamplerOption> for opentelemetry::sdk::trace::Sampler {
 
 impl From<&Trace> for opentelemetry::sdk::trace::Config {
     fn from(config: &Trace) -> Self {
-        let mut trace_config = opentelemetry::sdk::trace::config();
+        let mut common = opentelemetry::sdk::trace::config();
 
         let mut sampler: opentelemetry::sdk::trace::Sampler = config.sampler.clone().into();
         if config.parent_based_sampler {
             sampler = parent_based(sampler);
         }
 
-        trace_config = trace_config.with_sampler(sampler);
-        if let Some(n) = config.max_events_per_span {
-            trace_config = trace_config.with_max_events_per_span(n);
-        }
-        if let Some(n) = config.max_attributes_per_span {
-            trace_config = trace_config.with_max_attributes_per_span(n);
-        }
-        if let Some(n) = config.max_links_per_span {
-            trace_config = trace_config.with_max_links_per_span(n);
-        }
-        if let Some(n) = config.max_attributes_per_event {
-            trace_config = trace_config.with_max_attributes_per_event(n);
-        }
-        if let Some(n) = config.max_attributes_per_link {
-            trace_config = trace_config.with_max_attributes_per_link(n);
-        }
+        common = common.with_sampler(sampler);
+        common = common.with_max_events_per_span(config.max_events_per_span);
+        common = common.with_max_attributes_per_span(config.max_attributes_per_span);
+        common = common.with_max_links_per_span(config.max_links_per_span);
+        common = common.with_max_attributes_per_event(config.max_attributes_per_event);
+        common = common.with_max_attributes_per_link(config.max_attributes_per_link);
 
-        let mut resource_defaults = vec![];
-        if let Some(service_name) = &config.service_name {
-            resource_defaults.push(KeyValue::new(
-                opentelemetry_semantic_conventions::resource::SERVICE_NAME,
-                service_name.clone(),
-            ));
-        } else if std::env::var("OTEL_SERVICE_NAME").is_err() {
-            resource_defaults.push(KeyValue::new(
-                opentelemetry_semantic_conventions::resource::SERVICE_NAME,
-                "router".to_string(),
-            ));
-        }
-        if let Some(service_namespace) = &config.service_namespace {
-            resource_defaults.push(KeyValue::new(
-                opentelemetry_semantic_conventions::resource::SERVICE_NAMESPACE,
-                service_namespace.clone(),
-            ));
-        }
-        resource_defaults.push(KeyValue::new(
-            opentelemetry_semantic_conventions::resource::SERVICE_VERSION,
-            std::env!("CARGO_PKG_VERSION"),
-        ));
-
-        if let Some(executable_name) = std::env::current_exe().ok().and_then(|path| {
-            path.file_name()
-                .and_then(|p| p.to_str().map(|s| s.to_string()))
-        }) {
-            resource_defaults.push(KeyValue::new(
-                opentelemetry_semantic_conventions::resource::PROCESS_EXECUTABLE_NAME,
-                executable_name,
-            ));
-        }
-
-        let resource = Resource::new(resource_defaults).merge(&mut Resource::new(
-            config
-                .attributes
-                .iter()
-                .map(|(k, v)| {
-                    KeyValue::new(
-                        opentelemetry::Key::from(k.clone()),
-                        opentelemetry::Value::from(v.clone()),
-                    )
-                })
-                .collect::<Vec<KeyValue>>(),
-        ));
-
-        trace_config = trace_config.with_resource(resource);
-        trace_config
+        // Take the default first, then config, then env resources, then env variable. Last entry wins
+        common = common.with_resource(config.to_resource());
+        common
     }
 }
 
@@ -502,16 +612,8 @@ impl Conf {
     pub(crate) fn calculate_field_level_instrumentation_ratio(&self) -> Result<f64, Error> {
         Ok(
             match (
-                self.tracing
-                    .clone()
-                    .unwrap_or_default()
-                    .trace_config
-                    .unwrap_or_default()
-                    .sampler,
-                self.apollo
-                    .clone()
-                    .unwrap_or_default()
-                    .field_level_instrumentation_sampler,
+                &self.tracing.common.sampler,
+                &self.apollo.field_level_instrumentation_sampler,
             ) {
                 // Error conditions
                 (
@@ -527,16 +629,25 @@ impl Conf {
                 (
                     SamplerOption::Always(Sampler::AlwaysOff),
                     SamplerOption::TraceIdRatioBased(ratio),
-                ) if ratio != 0.0 => Err(Error::InvalidFieldLevelInstrumentationSampler)?,
+                ) if *ratio != 0.0 => Err(Error::InvalidFieldLevelInstrumentationSampler)?,
                 (
                     SamplerOption::TraceIdRatioBased(ratio),
                     SamplerOption::Always(Sampler::AlwaysOn),
-                ) if ratio != 1.0 => Err(Error::InvalidFieldLevelInstrumentationSampler)?,
+                ) if *ratio != 1.0 => Err(Error::InvalidFieldLevelInstrumentationSampler)?,
 
                 // Happy paths
-                (_, SamplerOption::TraceIdRatioBased(ratio)) if ratio == 0.0 => 0.0,
-                (SamplerOption::TraceIdRatioBased(ratio), _) if ratio == 0.0 => 0.0,
+                (_, SamplerOption::TraceIdRatioBased(ratio)) if *ratio == 0.0 => 0.0,
+                (SamplerOption::TraceIdRatioBased(ratio), _) if *ratio == 0.0 => 0.0,
                 (_, SamplerOption::Always(Sampler::AlwaysOn)) => 1.0,
+                // the `field_ratio` should be a ratio of the entire set of requests. But FTV1 would only be reported
+                // if a trace was generated with the Apollo exporter, which has its own sampling `global_ratio`.
+                // in telemetry::request_ftv1, we activate FTV1 if the current trace is sampled and depending on
+                // the ratio returned by this function.
+                // This means that:
+                // - field_ratio cannot be larger than global_ratio (see above, we return an error in that case)
+                // - we have to divide field_ratio by global_ratio
+                // Example: we want to measure FTV1 on 30% of total requests, but we the Apollo tracer samples at 50%.
+                // If we measure FTV1 on 60% (0.3 / 0.5) of these sampled requests, that amounts to 30% of the total traffic
                 (
                     SamplerOption::TraceIdRatioBased(global_ratio),
                     SamplerOption::TraceIdRatioBased(field_ratio),
@@ -544,25 +655,24 @@ impl Conf {
                 (
                     SamplerOption::Always(Sampler::AlwaysOn),
                     SamplerOption::TraceIdRatioBased(field_ratio),
-                ) => field_ratio,
+                ) => *field_ratio,
                 (_, _) => 0.0,
             },
         )
     }
 }
 
-fn string_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-    String::json_schema(gen)
-}
-
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
     fn test_logging_conf_validation() {
         let logging_conf = Logging {
             format: LoggingFormat::default(),
+            display_target: false,
             display_filename: false,
             display_line_number: false,
             when_header: vec![HeaderLoggingCondition::Value {
@@ -577,6 +687,7 @@ mod tests {
 
         let logging_conf = Logging {
             format: LoggingFormat::default(),
+            display_target: false,
             display_filename: false,
             display_line_number: false,
             when_header: vec![HeaderLoggingCondition::Value {
@@ -596,6 +707,7 @@ mod tests {
     fn test_logging_conf_should_log() {
         let logging_conf = Logging {
             format: LoggingFormat::default(),
+            display_target: false,
             display_filename: false,
             display_line_number: false,
             when_header: vec![HeaderLoggingCondition::Matching {
@@ -613,6 +725,7 @@ mod tests {
 
         let logging_conf = Logging {
             format: LoggingFormat::default(),
+            display_target: false,
             display_filename: false,
             display_line_number: false,
             when_header: vec![HeaderLoggingCondition::Value {
@@ -626,6 +739,7 @@ mod tests {
 
         let logging_conf = Logging {
             format: LoggingFormat::default(),
+            display_target: false,
             display_filename: false,
             display_line_number: false,
             when_header: vec![
@@ -647,6 +761,7 @@ mod tests {
 
         let logging_conf = Logging {
             format: LoggingFormat::default(),
+            display_target: false,
             display_filename: false,
             display_line_number: false,
             when_header: vec![HeaderLoggingCondition::Matching {
@@ -657,5 +772,52 @@ mod tests {
             }],
         };
         assert_eq!(logging_conf.should_log(&req), (false, false));
+    }
+
+    #[test]
+    fn test_attribute_value_from_json() {
+        assert_eq!(
+            AttributeValue::try_from(json!("foo")),
+            Ok(AttributeValue::String("foo".to_string()))
+        );
+        assert_eq!(
+            AttributeValue::try_from(json!(1)),
+            Ok(AttributeValue::I64(1))
+        );
+        assert_eq!(
+            AttributeValue::try_from(json!(1.1)),
+            Ok(AttributeValue::F64(1.1))
+        );
+        assert_eq!(
+            AttributeValue::try_from(json!(true)),
+            Ok(AttributeValue::Bool(true))
+        );
+        assert_eq!(
+            AttributeValue::try_from(json!(["foo", "bar"])),
+            Ok(AttributeValue::Array(AttributeArray::String(vec![
+                "foo".to_string(),
+                "bar".to_string()
+            ])))
+        );
+        assert_eq!(
+            AttributeValue::try_from(json!([1, 2])),
+            Ok(AttributeValue::Array(AttributeArray::I64(vec![1, 2])))
+        );
+        assert_eq!(
+            AttributeValue::try_from(json!([1.1, 1.5])),
+            Ok(AttributeValue::Array(AttributeArray::F64(vec![1.1, 1.5])))
+        );
+        assert_eq!(
+            AttributeValue::try_from(json!([true, false])),
+            Ok(AttributeValue::Array(AttributeArray::Bool(vec![
+                true, false
+            ])))
+        );
+
+        // Mixed array conversions
+        AttributeValue::try_from(json!(["foo", true])).expect_err("mixed conversion must fail");
+        AttributeValue::try_from(json!([1, true])).expect_err("mixed conversion must fail");
+        AttributeValue::try_from(json!([1.1, true])).expect_err("mixed conversion must fail");
+        AttributeValue::try_from(json!([true, "bar"])).expect_err("mixed conversion must fail");
     }
 }

@@ -1,7 +1,7 @@
 use std::fmt;
 
-use ansi_term::Color;
-use ansi_term::Style;
+use nu_ansi_term::Color;
+use nu_ansi_term::Style;
 use opentelemetry::trace::TraceContextExt;
 use tracing_core::Event;
 use tracing_core::Level;
@@ -17,9 +17,14 @@ use tracing_subscriber::fmt::time::SystemTime;
 use tracing_subscriber::fmt::FmtContext;
 use tracing_subscriber::registry::LookupSpan;
 
+use crate::plugins::telemetry::reload::IsSampled;
+
 #[derive(Debug, Clone)]
 pub(crate) struct TextFormatter {
     pub(crate) timer: SystemTime,
+    display_target: bool,
+    display_filename: bool,
+    display_line: bool,
 }
 
 impl Default for TextFormatter {
@@ -31,13 +36,37 @@ impl Default for TextFormatter {
 impl TextFormatter {
     const TRACE_STR: &'static str = "TRACE";
     const DEBUG_STR: &'static str = "DEBUG";
-    const INFO_STR: &'static str = " INFO";
-    const WARN_STR: &'static str = " WARN";
+    const INFO_STR: &'static str = "INFO";
+    const WARN_STR: &'static str = "WARN";
     const ERROR_STR: &'static str = "ERROR";
 
     pub(crate) fn new() -> Self {
         Self {
             timer: Default::default(),
+            display_target: false,
+            display_filename: false,
+            display_line: false,
+        }
+    }
+
+    pub(crate) fn with_target(self, display_target: bool) -> Self {
+        Self {
+            display_target,
+            ..self
+        }
+    }
+
+    pub(crate) fn with_filename(self, display_filename: bool) -> Self {
+        Self {
+            display_filename,
+            ..self
+        }
+    }
+
+    pub(crate) fn with_line(self, display_line: bool) -> Self {
+        Self {
+            display_line,
+            ..self
         }
     }
 
@@ -92,7 +121,15 @@ impl TextFormatter {
             if writer.has_ansi_escapes() {
                 let style = Style::new().dimmed();
                 write!(writer, "{}", style.prefix())?;
-                write!(writer, "{filename}:{line}")?;
+                if self.display_filename {
+                    write!(writer, "{filename}")?;
+                }
+                if self.display_filename && self.display_line {
+                    write!(writer, ":")?;
+                }
+                if self.display_line {
+                    write!(writer, "{line}")?;
+                }
                 write!(writer, "{}", style.suffix())?;
             } else {
                 write!(writer, "{filename}:{line}")?;
@@ -108,10 +145,10 @@ impl TextFormatter {
         if writer.has_ansi_escapes() {
             let style = Style::new().dimmed();
             write!(writer, "{}", style.prefix())?;
-            write!(writer, "{}:", target)?;
+            write!(writer, "{target}:")?;
             write!(writer, "{}", style.suffix())?;
         } else {
-            write!(writer, "{}:", target)?;
+            write!(writer, "{target}:")?;
         }
         writer.write_char(' ')
     }
@@ -150,7 +187,11 @@ impl TextFormatter {
                     }
                     writer.write_char(' ')?;
                 }
-                None => eprintln!("Unable to find OtelData in extensions; this is a bug"),
+                None => {
+                    if span.is_sampled() {
+                        eprintln!("Unable to find OtelData in extensions; this is a bug");
+                    }
+                }
             }
         }
 
@@ -175,7 +216,9 @@ where
 
         self.format_level(meta.level(), &mut writer)?;
         self.format_request_id(ctx, &mut writer, event)?;
-        self.format_target(meta.target(), &mut writer)?;
+        if self.display_target {
+            self.format_target(meta.target(), &mut writer)?;
+        }
         let mut visitor = CustomVisitor::new(DefaultVisitor::new(writer.by_ref(), true));
         event.record(&mut visitor);
 
